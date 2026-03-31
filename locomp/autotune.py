@@ -20,8 +20,57 @@ Usage:
 from __future__ import annotations
 
 import inspect
+import json
+import os
 import time
+from pathlib import Path
 from typing import Any, Callable
+
+# --- Persistent cache ---
+
+_CACHE_DIR = Path.home() / ".cache" / "locomp"
+_CACHE_FILE = _CACHE_DIR / "autotune.json"
+_disk_cache: dict | None = None
+
+
+def _get_gpu_name() -> str:
+    """Get the Metal GPU device name (e.g. 'Apple M1')."""
+    try:
+        from locomp.backends.metal_runtime import get_runtime
+        return get_runtime().device_name
+    except Exception:
+        return "unknown"
+
+
+def _load_disk_cache() -> dict:
+    """Load persistent autotune cache from disk."""
+    global _disk_cache
+    if _disk_cache is not None:
+        return _disk_cache
+    if _CACHE_FILE.exists():
+        try:
+            _disk_cache = json.loads(_CACHE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            _disk_cache = {}
+    else:
+        _disk_cache = {}
+    return _disk_cache
+
+
+def _save_disk_cache():
+    """Write persistent autotune cache to disk."""
+    if _disk_cache is None:
+        return
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _CACHE_FILE.write_text(json.dumps(_disk_cache, indent=2))
+
+
+def clear_cache():
+    """Clear the persistent autotune cache (all kernels, all GPUs)."""
+    global _disk_cache
+    _disk_cache = {}
+    if _CACHE_FILE.exists():
+        _CACHE_FILE.unlink()
 
 
 class Config:
@@ -75,9 +124,17 @@ class AutotunedKernel:
         self.warmup = warmup
         self.rep = rep
         self._cache: dict[tuple, int] = {}
+        self._gpu_name: str | None = None
         # Extract Python param names from the original function signature
         sig = inspect.signature(launcher.func)
         self._py_names = list(sig.parameters.keys())
+
+    def _disk_key(self, cache_key: tuple) -> str:
+        """Build a string key for the persistent cache: kernel:gpu:problem_dims."""
+        if self._gpu_name is None:
+            self._gpu_name = _get_gpu_name()
+        key_str = ",".join(f"{k}={v}" for k, v in zip(self.key, cache_key))
+        return f"{self.launcher.func_name}:{self._gpu_name}:{key_str}"
 
     def __call__(self, *args):
         # Map positional user args to Python param names
@@ -93,9 +150,19 @@ class AutotunedKernel:
         # Cache key from user-specified key params
         cache_key = tuple(py_constexprs.get(k, 0) for k in self.key)
 
+        # Check in-memory cache first
         if cache_key in self._cache:
             return self._dispatch(user_values, py_constexprs,
                                   self.configs[self._cache[cache_key]])
+
+        # Check persistent disk cache
+        dk = self._disk_key(cache_key)
+        disk = _load_disk_cache()
+        if dk in disk:
+            idx = disk[dk]
+            if 0 <= idx < len(self.configs):
+                self._cache[cache_key] = idx
+                return self._dispatch(user_values, py_constexprs, self.configs[idx])
 
         # Benchmark all configs
         best_time = float('inf')
@@ -128,6 +195,10 @@ class AutotunedKernel:
         cfg = self.configs[best_idx]
         key_desc = dict(zip(self.key, cache_key))
         print(f"[autotune] {key_desc} -> {cfg} ({best_time*1000:.3f}ms)")
+
+        # Persist to disk
+        disk[dk] = best_idx
+        _save_disk_cache()
 
         return self._dispatch(user_values, py_constexprs, cfg)
 

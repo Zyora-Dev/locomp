@@ -3,7 +3,7 @@ Locomp — A GPU compute compiler for Apple Metal.
 Write GPU kernels in Python, compile to native Metal shaders.
 """
 
-from locomp.autotune import Config, autotune
+from locomp.autotune import Config, autotune, clear_cache
 from locomp.api import (
     kernel,
     program_id,
@@ -72,6 +72,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Config",
     "autotune",
+    "clear_cache",
     "kernel",
     "program_id",
     "thread_id",
