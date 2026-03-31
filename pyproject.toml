@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [
     {name = "Locomp Contributors"}
 ]
-keywords = ["gpu", "compiler", "metal", "apple-silicon", "cuda", "compute", "kernel"]
+keywords = ["gpu", "compiler", "metal", "apple-silicon", "compute", "kernel"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

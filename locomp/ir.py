@@ -8,7 +8,7 @@ arithmetic, reductions, and control flow.
 IR Design Principles:
 1. Tiled — operations work on blocks/tiles, not individual elements
 2. Explicit memory — loads and stores are explicit (not implicit like NumPy)
-3. Backend-agnostic — no Metal/CUDA/AMD specifics in the IR
+3. Backend-agnostic — no Metal-specific details leak into the IR
 4. SSA form — each value defined exactly once (Static Single Assignment)
 """
 

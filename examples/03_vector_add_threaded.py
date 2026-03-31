@@ -1,7 +1,7 @@
 """
 Example: Threaded Vector Addition on Apple GPU using Locust.
 
-Unlike 01_vector_add.py which uses 1 thread per threadgroup (Triton-style tiling),
+Unlike 01_vector_add.py which uses 1 thread per threadgroup (tiled style),
 this uses real GPU threading: each thread handles one element.
 
 Demonstrates: thread_id(), threadgroup dispatch, multi-thread parallelism.

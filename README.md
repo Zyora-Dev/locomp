@@ -1,63 +1,63 @@
-# Locust 🔥
+# Locomp
 
-**A universal GPU compute compiler — write once, run on Apple Metal, NVIDIA, AMD.**
+**A GPU compute compiler for Apple Silicon — write kernels in Python, compile to native Metal shaders.**
 
-Locust lets you write GPU kernels in Python and compiles them to native GPU code for any hardware. Apple Silicon first.
+Write GPU kernels in Python. Locomp compiles them to optimized Metal shaders and dispatches on Apple M1/M2/M3/M4.
 
 ```python
-import locust
+import locomp
 
-@locust.kernel
-def vector_add(X: locust.Tensor, Y: locust.Tensor, OUT: locust.Tensor, N: locust.constexpr):
-    pid = locust.program_id(0)
-    offsets = pid * 256 + locust.arange(0, 256)
+@locomp.kernel
+def vector_add(X: locomp.Tensor, Y: locomp.Tensor, OUT: locomp.Tensor, N: locomp.constexpr):
+    pid = locomp.program_id(0)
+    offsets = pid * 256 + locomp.arange(0, 256)
     mask = offsets < N
-    x = locust.load(X + offsets, mask=mask)
-    y = locust.load(Y + offsets, mask=mask)
-    locust.store(OUT + offsets, x + y, mask=mask)
+    x = locomp.load(X + offsets, mask=mask)
+    y = locomp.load(Y + offsets, mask=mask)
+    locomp.store(OUT + offsets, x + y, mask=mask)
 
-# Runs on Apple M1/M2/M3/M4 GPU — no CUDA required
-x = locust.tensor([1.0, 2.0, 3.0, 4.0])
-y = locust.tensor([5.0, 6.0, 7.0, 8.0])
-out = locust.empty(4)
+# Runs on Apple GPU
+x = locomp.tensor([1.0, 2.0, 3.0, 4.0])
+y = locomp.tensor([5.0, 6.0, 7.0, 8.0])
+out = locomp.empty(4)
 vector_add[(1,)](x, y, out, N=4)
 print(out)  # [6.0, 8.0, 10.0, 12.0]
 ```
 
-## Why Locust?
-
-| Feature | Triton | CUDA | Locust |
-|---|---|---|---|
-| Apple Silicon | ❌ | ❌ | ✅ |
-| NVIDIA GPU | ✅ | ✅ | ✅ (planned) |
-| AMD GPU | Partial | ❌ | Planned |
-| Language | Python DSL | C++ | Python DSL |
-| Ownership | OpenAI | NVIDIA | **Community** |
-
 ## Architecture
 
 ```
-@locust.kernel (Python DSL)
+@locomp.kernel (Python DSL)
         ↓
-    Locust IR (tiled compute operations)
+    Locomp IR (SSA, tiled compute operations)
         ↓
-    Optimization passes (tiling, vectorization, memory coalescing)
+    Optimization passes (constant folding, DCE, type inference)
         ↓
-    Backend codegen:
-        ├── Apple Metal → MSL → Apple GPU
-        ├── NVIDIA → PTX (planned)
-        └── AMD → AMDGPU (planned)
+    Metal codegen → MSL → Apple GPU
 ```
+
+## What's Working
+
+- **Full compiler pipeline**: Python AST → SSA IR (60+ opcodes) → optimizer → Metal codegen
+- **Simdgroup matrix ops**: Hardware 8×8 matmul via `simdgroup_multiply_accumulate`
+- **25 math ops**: trig, hyperbolic, exp/log, rounding, fma, clamp, sigmoid, etc.
+- **Autotune**: `locomp.autotune` + `locomp.Config` — benchmark configs, cache best
+- **Native async dispatch**: C bridge with lazy sync — minimal overhead
+- **Constexpr inlining**: Kernel params as MSL literals for compiler optimizations
+- **25 examples**: matmul, softmax, flash attention, multi-head attention, GELU, LayerNorm
+
+### Benchmarks vs MLX (Apple M1)
+
+- **Matmul**: beats MLX at 4/6 sizes (0.87×–0.97×)
+- **Softmax**: beats MLX at 4/5 sizes (0.87×–0.98×)
+- **Multi-head attention**: beats MLX at all 5 tested configs (0.77×–0.96×)
+- **Flash attention**: beats MLX at N≤128 with async dispatch
 
 ## Install
 
 ```bash
-pip install locust-gpu
+pip install locomp
 ```
-
-## Status
-
-🚧 **Phase 1: Apple Metal MVP** — Under active development.
 
 ## License
 

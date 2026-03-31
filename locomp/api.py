@@ -142,8 +142,7 @@ class KernelLauncher:
             else:
                 raise RuntimeError(
                     "No GPU backend available. "
-                    "Apple Metal requires macOS. "
-                    "NVIDIA/AMD backends not yet implemented."
+                    "Apple Metal requires macOS."
                 )
         return backend
 

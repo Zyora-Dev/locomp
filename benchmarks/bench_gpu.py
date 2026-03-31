@@ -270,7 +270,7 @@ def main():
     print("└──────────┴──────────┴──────────┴──────────┴──────────┴─────────┘")
 
     print("\nAll times in milliseconds (lower is better)")
-    print("Locust: custom compiler, pure Python → MSL, no LLVM/Triton")
+    print("Locomp: custom compiler, pure Python → MSL")
     print("MLX: Apple's ML framework (v0.31.1)")
     print("PyTorch: MPS backend (v2.9.1)")
     print("NumPy: CPU baseline (Accelerate BLAS)")
