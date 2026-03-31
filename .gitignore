@@ -27,3 +27,7 @@ env/
 
 # Egg info
 *.egg-info/
+
+# Internal dev notes
+progress.md
+roadmap.md
