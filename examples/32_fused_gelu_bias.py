@@ -23,6 +23,7 @@ def fused_gelu_bias(X: locomp.Tensor, Bias: locomp.Tensor, OUT: locomp.Tensor,
     # GELU approximation (tanh version)
     # 0.7978845608 = sqrt(2/pi)
     inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+    inner = locomp.clamp(inner, -10.0, 10.0)
     out = 0.5 * x * (1.0 + locomp.tanh(inner))
     locomp.store(OUT + idx, out)
 

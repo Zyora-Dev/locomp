@@ -140,6 +140,7 @@ def k_gelu(X: locomp.Tensor, O: locomp.Tensor, N: locomp.constexpr):
     x = locomp.load(X + i)
     # GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+    inner = locomp.clamp(inner, -10.0, 10.0)
     locomp.store(O + i, 0.5 * x * (1.0 + locomp.tanh(inner)))
 
 

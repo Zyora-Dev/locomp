@@ -48,9 +48,10 @@ def gelu_auto(X: locomp.Tensor, O: locomp.Tensor,
     tid = locomp.local_id(0)
     idx = pid * BLOCK_SIZE + tid
     x = locomp.load(X + idx)
-    # GELU approximation
-    locomp.store(O + idx, 0.5 * x * (1.0 + locomp.tanh(
-        0.7978845608 * (x + 0.044715 * x * x * x))))
+    # GELU approximation (clamp inner to prevent tanh overflow)
+    inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+    inner = locomp.clamp(inner, -10.0, 10.0)
+    locomp.store(O + idx, 0.5 * x * (1.0 + locomp.tanh(inner)))
 
 
 # --- Fixed-config GELU for comparison ---
@@ -61,8 +62,9 @@ def gelu_fixed(X: locomp.Tensor, O: locomp.Tensor,
     tid = locomp.local_id(0)
     idx = pid * BLOCK_SIZE + tid
     x = locomp.load(X + idx)
-    locomp.store(O + idx, 0.5 * x * (1.0 + locomp.tanh(
-        0.7978845608 * (x + 0.044715 * x * x * x))))
+    inner = 0.7978845608 * (x + 0.044715 * x * x * x)
+    inner = locomp.clamp(inner, -10.0, 10.0)
+    locomp.store(O + idx, 0.5 * x * (1.0 + locomp.tanh(inner)))
 
 
 def gelu_np(x):
