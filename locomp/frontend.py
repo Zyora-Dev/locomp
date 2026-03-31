@@ -445,25 +445,47 @@ class KernelCompiler(ast.NodeVisitor):
             acc = self._visit_expr(node.args[0])
             a = self._visit_expr(node.args[1])
             b = self._visit_expr(node.args[2])
-            result = self.kernel.new_value("smac", acc.dtype)
+            # Result dtype follows input matrices (a, b), not the accumulator
+            # This handles mixed cases like float32 acc + half8x8 inputs
+            result_dtype = a.dtype
+            result = self.kernel.new_value("smat", result_dtype)
             result.is_simdgroup_matrix = True
             self.kernel.add_op(OpCode.SIMDGROUP_MATRIX_MAC, result, [acc, a, b])
             return result
 
-        # locomp.simdgroup_matrix(fill_value) — create matrix filled with constant
+        # locomp.simdgroup_matrix(fill_value, dtype=None) — create matrix filled with constant
         if func_name == "simdgroup_matrix":
             fill = self._visit_expr(node.args[0])
-            result = self.kernel.new_value("smat", fill.dtype)
+            mat_dtype = fill.dtype
+            # Optional second arg: locomp.Float16 → FLOAT16
+            if len(node.args) > 1:
+                dtype_node = node.args[1]
+                if isinstance(dtype_node, ast.Attribute) and dtype_node.attr in ("Float16", "float16"):
+                    mat_dtype = IRType.FLOAT16
+            result = self.kernel.new_value("smat", mat_dtype)
             result.is_simdgroup_matrix = True
             self.kernel.add_op(OpCode.SIMDGROUP_MATRIX_FILL, result, [fill])
             return result
 
         # locomp.shared_memory(size, dtype) — allocate threadgroup shared memory
         if func_name == "shared_memory":
-            size = self._eval_const_size(node.args[0])
+            try:
+                size = self._eval_const_size(node.args[0])
+            except ValueError:
+                # Size depends on constexpr params — store as symbolic IRValue
+                size = self._visit_expr(node.args[0])
+            # Determine dtype: default FLOAT32, but locomp.Float16 → FLOAT16
+            smem_dtype = IRType.FLOAT32
+            if len(node.args) > 1:
+                dtype_node = node.args[1]
+                if isinstance(dtype_node, ast.Attribute) and dtype_node.attr == "Float16":
+                    smem_dtype = IRType.FLOAT16
+                elif isinstance(dtype_node, ast.Attribute) and dtype_node.attr == "float16":
+                    smem_dtype = IRType.FLOAT16
             name = f"smem_{len(self.kernel.shared_mem)}"
-            self.kernel.shared_mem[name] = (IRType.FLOAT32, size)
-            result = self.kernel.new_value(name, IRType.FLOAT32, shape=(size,))
+            self.kernel.shared_mem[name] = (smem_dtype, size)
+            shape = (size,) if isinstance(size, int) else None
+            result = self.kernel.new_value(name, smem_dtype, shape=shape)
             self.kernel.add_op(OpCode.CONSTANT, result, attrs={"shared_mem": name, "value": 0})
             return result
 
@@ -606,6 +628,10 @@ class KernelCompiler(ast.NodeVisitor):
                 for op in self.kernel.ops:
                     if op.result.id == val.id and op.opcode == OpCode.CONSTANT:
                         return int(op.attrs["value"])
+                # If it's a constexpr param (not a constant), DON'T use globals — value is unknown at IR time
+                constexpr_param_ids = {p.id for p in self.kernel.params if not p.is_pointer}
+                if val.id in constexpr_param_ids:
+                    raise ValueError(f"Constexpr parameter '{node.id}' — cannot evaluate at IR time")
             # Try the function's closure/globals (module-level constants like TILE=16)
             if hasattr(self, '_func_globals') and node.id in self._func_globals:
                 return int(self._func_globals[node.id])

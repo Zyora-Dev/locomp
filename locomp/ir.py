@@ -214,7 +214,7 @@ class IRKernel:
     params: list[IRValue]           # kernel parameters (pointers + constexprs)
     ops: list[IROp] = field(default_factory=list)
     grid_dim: int = 1               # number of grid dimensions
-    shared_mem: dict[str, tuple[IRType, int]] = field(default_factory=dict)  # name → (dtype, size)
+    shared_mem: dict[str, tuple[IRType, int | 'IRValue']] = field(default_factory=dict)  # name → (dtype, size or IRValue)
     _next_id: int = field(default=0, repr=False)
 
     def new_value(self, name: str, dtype: IRType, shape: tuple = (),

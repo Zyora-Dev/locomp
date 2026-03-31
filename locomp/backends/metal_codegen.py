@@ -128,7 +128,10 @@ class MetalCodegen:
         # Declare shared memory
         for name, (dtype, size) in self.kernel.shared_mem.items():
             msl_type = dtype.to_msl()
-            lines.append(f"{self.indent}threadgroup {msl_type} {name}[{size}];")
+            # Size can be an int literal or an IRValue (constexpr param) — resolve via _var
+            from locomp.ir import IRValue
+            size_str = self._var(size) if isinstance(size, IRValue) else str(size)
+            lines.append(f"{self.indent}threadgroup {msl_type} {name}[{size_str}];")
         if self.kernel.shared_mem:
             lines.append("")
 
@@ -320,9 +323,18 @@ class MetalCodegen:
             a = self._var(op.operands[1])
             b = self._var(op.operands[2])
             mat_type = self._simdgroup_type(op.result.dtype)
+            acc_type = self._simdgroup_type(op.operands[0].dtype)
+            # If accumulator type doesn't match result (e.g. float fill with half inputs),
+            # cast by declaring a new typed accumulator initialized from the old one
+            lines = []
+            if acc_type != mat_type:
+                cast_acc = f"_cast_{acc}"
+                lines.append(f"{mat_type} {cast_acc} = {mat_type}(0);")
+                acc = cast_acc
             if op.result.aliases is not None:
-                return f"simdgroup_multiply_accumulate({result_var}, {a}, {b}, {acc});"
-            lines = [f"{mat_type} {result_var};"]
+                lines.append(f"simdgroup_multiply_accumulate({result_var}, {a}, {b}, {acc});")
+                return lines if len(lines) > 1 else lines[0]
+            lines.append(f"{mat_type} {result_var};")
             lines.append(f"simdgroup_multiply_accumulate({result_var}, {a}, {b}, {acc});")
             return lines
 
