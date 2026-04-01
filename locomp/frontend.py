@@ -80,8 +80,6 @@ _FUNC_MAP = {
     "exp": OpCode.EXP,
     "log": OpCode.LOG,
     "abs": OpCode.ABS,
-    "max": OpCode.MAX,
-    "min": OpCode.MIN,
     "sum": OpCode.REDUCE_SUM,
     "tanh": OpCode.TANH,
     "sin": OpCode.SIN,
@@ -715,12 +713,20 @@ class KernelCompiler(ast.NodeVisitor):
             self.kernel.add_op(OpCode.CLAMP, result, [x, lo, hi])
             return result
 
-        if func_name in ("pow", "atan2", "copysign", "fmod", "step"):
+        if func_name in ("pow", "atan2", "copysign", "fmod", "step", "max", "min"):
             _two_arg_ops = {
                 "pow": OpCode.POW, "atan2": OpCode.ATAN2,
                 "copysign": OpCode.COPYSIGN, "fmod": OpCode.FMOD,
                 "step": OpCode.STEP,
+                "max": OpCode.MAX, "min": OpCode.MIN,
             }
+            if func_name in ("max", "min") and len(node.args) == 1:
+                # 1-arg: reduce max/min on a tile
+                arg = self._visit_expr(node.args[0])
+                opcode = OpCode.REDUCE_MAX if func_name == "max" else OpCode.REDUCE_MIN
+                result = self.kernel.new_value("reduced", arg.dtype)
+                self.kernel.add_op(opcode, result, [arg])
+                return result
             a = self._visit_expr(node.args[0])
             b = self._visit_expr(node.args[1])
             result = self.kernel.new_value("math", a.dtype, shape=a.shape)

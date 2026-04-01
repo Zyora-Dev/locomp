@@ -450,13 +450,13 @@ class MetalCodegen:
             msl_type = self._msl_type(op.result.dtype)
             return f"{msl_type} {result_var} = 1.0 / (1.0 + exp(-{arg}));"
 
-        # 2-arg math: pow, atan2, copysign, fmod, step
+        # 2-arg math: pow, atan2, copysign, fmod, step, max, min
         elif op.opcode in (OpCode.POW, OpCode.ATAN2, OpCode.COPYSIGN,
-                           OpCode.FMOD, OpCode.STEP):
+                           OpCode.FMOD, OpCode.STEP, OpCode.MAX, OpCode.MIN):
             func_name = {
                 OpCode.POW: "pow", OpCode.ATAN2: "atan2",
                 OpCode.COPYSIGN: "copysign", OpCode.FMOD: "fmod",
-                OpCode.STEP: "step",
+                OpCode.STEP: "step", OpCode.MAX: "max", OpCode.MIN: "min",
             }[op.opcode]
             a = self._var(op.operands[0])
             b = self._var(op.operands[1])
@@ -590,6 +590,9 @@ class MetalCodegen:
 
             idx_var = self._var(idx_op)
             is_tiled = bool(idx_op.shape)
+            # Cast float indices to int for valid MSL array subscript
+            if idx_op.dtype.is_float and not is_tiled:
+                idx_var = f"(int){idx_var}"
             self._ptr_exprs[op.result.id] = (base_ptr, idx_var, is_tiled)
             return None  # No MSL emitted — LOAD/STORE will use the ptr expression
 
@@ -692,7 +695,8 @@ class MetalCodegen:
         """Generate atomic operations."""
         result_var = self._var(op.result)
         ptr = op.operands[0]
-        val = self._var(op.operands[1])
+        val_var = self._var(op.operands[1])
+        val_op = op.operands[1]
         msl_type = self._msl_type(op.result.dtype)
 
         func_map = {
@@ -702,15 +706,24 @@ class MetalCodegen:
         }
         func = func_map[op.opcode]
 
+        # Determine atomic type from value dtype
+        if val_op.dtype.is_float:
+            atomic_type = "atomic<float>"
+            # Cast value to float to avoid type mismatch
+            val_expr = f"(float){val_var}"
+        else:
+            atomic_type = "atomic_int"
+            val_expr = val_var
+
         if ptr.id in self._ptr_exprs:
             base_ptr, idx_var, _ = self._ptr_exprs[ptr.id]
-            addr = f"(device atomic_int*)({base_ptr} + {idx_var})"
+            addr = f"(device {atomic_type}*)({base_ptr} + {idx_var})"
         elif ptr.is_pointer:
-            addr = f"(device atomic_int*){self._var(ptr)}"
+            addr = f"(device {atomic_type}*){self._var(ptr)}"
         else:
-            addr = f"(device atomic_int*){self._var(ptr)}"
+            addr = f"(device {atomic_type}*){self._var(ptr)}"
 
-        return f"{msl_type} {result_var} = {func}({addr}, {val}, memory_order_relaxed);"
+        return f"{msl_type} {result_var} = {func}({addr}, {val_expr}, memory_order_relaxed);"
 
 
 def compile_to_metal(kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None,
