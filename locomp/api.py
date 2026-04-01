@@ -33,19 +33,38 @@ Bool = Bool
 
 
 class LocompTensor:
-    """A GPU-backed tensor. Wraps a Metal buffer + numpy array."""
+    """A GPU-backed tensor with shape/stride tracking.
+    
+    Supports zero-copy operations: reshape, view, transpose, permute.
+    Data stays on GPU until .numpy() is called.
+    """
 
     _SUPPORTED_DTYPES = {np.float16, np.float32, np.float64, np.int8, np.uint8, np.int32, np.bool_}
 
-    def __init__(self, data: np.ndarray, metal_buffer=None):
-        if data.dtype.type not in self._SUPPORTED_DTYPES:
-            data = data.astype(np.float32)
-        self.data = data
-        self._metal_buffer = metal_buffer
-        self._size = self.data.size
-        self._shape = self.data.shape
-        self._dtype = self.data.dtype
-        self._gpu_dirty = False  # True when GPU has newer data than CPU
+    def __init__(self, data: np.ndarray = None, metal_buffer=None, shape=None,
+                 strides=None, dtype=None, offset=0, base=None):
+        if data is not None:
+            if data.dtype.type not in self._SUPPORTED_DTYPES:
+                data = data.astype(np.float32)
+            self.data = data
+            self._metal_buffer = metal_buffer
+            self._size = data.size
+            self._shape = data.shape
+            self._strides = tuple(s // data.dtype.itemsize for s in data.strides)  # element strides
+            self._dtype = data.dtype
+        else:
+            # View constructor — no data copy, shares metal buffer
+            self.data = None
+            self._metal_buffer = metal_buffer
+            self._shape = tuple(shape)
+            self._strides = tuple(strides) if strides else None
+            self._dtype = np.dtype(dtype)
+            self._size = 1
+            for s in self._shape:
+                self._size *= s
+        self._offset = offset  # element offset into the buffer
+        self._base = base  # reference to base tensor (keeps it alive)
+        self._gpu_dirty = False
         self._freed = False
 
     @property
@@ -60,10 +79,175 @@ class LocompTensor:
     def dtype(self):
         return self._dtype
 
+    @property
+    def ndim(self):
+        return len(self._shape)
+
+    @property
+    def itemsize(self):
+        return self._dtype.itemsize
+
+    def is_contiguous(self):
+        """Check if tensor is C-contiguous (row-major)."""
+        if self._strides is None:
+            return True
+        expected = 1
+        for i in range(len(self._shape) - 1, -1, -1):
+            if self._shape[i] == 1:
+                continue
+            if self._strides[i] != expected:
+                return False
+            expected *= self._shape[i]
+        return True
+
+    def contiguous(self):
+        """Return a contiguous copy if not already contiguous."""
+        if self.is_contiguous() and self._offset == 0:
+            return self
+        # Need to copy — materialize via numpy and re-upload
+        np_data = self.numpy().copy()
+        return LocompTensor(np_data)
+
+    def reshape(self, *shape):
+        """Reshape tensor (zero-copy if contiguous)."""
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        # Handle -1
+        neg_idx = None
+        prod = 1
+        for i, s in enumerate(shape):
+            if s == -1:
+                if neg_idx is not None:
+                    raise ValueError("Only one -1 allowed in reshape")
+                neg_idx = i
+            else:
+                prod *= s
+        if neg_idx is not None:
+            shape = list(shape)
+            shape[neg_idx] = self._size // prod
+            shape = tuple(shape)
+        # Verify size match
+        new_size = 1
+        for s in shape:
+            new_size *= s
+        if new_size != self._size:
+            raise ValueError(f"Cannot reshape {self._shape} to {shape}: size mismatch ({self._size} vs {new_size})")
+        if not self.is_contiguous():
+            return self.contiguous().reshape(*shape)
+        # Zero-copy: compute new strides
+        new_strides = []
+        stride = 1
+        for s in reversed(shape):
+            new_strides.append(stride)
+            stride *= s
+        new_strides.reverse()
+        return LocompTensor(
+            shape=shape, strides=new_strides, dtype=self._dtype,
+            metal_buffer=self._metal_buffer, offset=self._offset,
+            base=self._base or self,
+        )
+
+    def view(self, *shape):
+        """Alias for reshape."""
+        return self.reshape(*shape)
+
+    def flatten(self):
+        """Flatten to 1D."""
+        return self.reshape(self._size)
+
+    def transpose(self, dim0=-2, dim1=-1):
+        """Swap two dimensions (zero-copy, just swaps strides)."""
+        ndim = len(self._shape)
+        if dim0 < 0:
+            dim0 += ndim
+        if dim1 < 0:
+            dim1 += ndim
+        new_shape = list(self._shape)
+        new_strides = list(self._strides) if self._strides else list(self._compute_strides())
+        new_shape[dim0], new_shape[dim1] = new_shape[dim1], new_shape[dim0]
+        new_strides[dim0], new_strides[dim1] = new_strides[dim1], new_strides[dim0]
+        return LocompTensor(
+            shape=tuple(new_shape), strides=tuple(new_strides), dtype=self._dtype,
+            metal_buffer=self._metal_buffer, offset=self._offset,
+            base=self._base or self,
+        )
+
+    def permute(self, *dims):
+        """Permute dimensions (zero-copy)."""
+        if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
+            dims = tuple(dims[0])
+        old_strides = self._strides if self._strides else self._compute_strides()
+        new_shape = tuple(self._shape[d] for d in dims)
+        new_strides = tuple(old_strides[d] for d in dims)
+        return LocompTensor(
+            shape=new_shape, strides=new_strides, dtype=self._dtype,
+            metal_buffer=self._metal_buffer, offset=self._offset,
+            base=self._base or self,
+        )
+
+    def unsqueeze(self, dim):
+        """Add a dimension of size 1."""
+        ndim = len(self._shape)
+        if dim < 0:
+            dim += ndim + 1
+        new_shape = list(self._shape)
+        new_shape.insert(dim, 1)
+        strides = list(self._strides) if self._strides else list(self._compute_strides())
+        # Stride for dim of size 1 doesn't matter, use neighbor's
+        if dim < len(strides):
+            strides.insert(dim, strides[dim])
+        else:
+            strides.append(1)
+        return LocompTensor(
+            shape=tuple(new_shape), strides=tuple(strides), dtype=self._dtype,
+            metal_buffer=self._metal_buffer, offset=self._offset,
+            base=self._base or self,
+        )
+
+    def squeeze(self, dim=None):
+        """Remove dimensions of size 1."""
+        if dim is not None:
+            ndim = len(self._shape)
+            if dim < 0:
+                dim += ndim
+            if self._shape[dim] != 1:
+                return self
+            new_shape = list(self._shape)
+            new_strides = list(self._strides) if self._strides else list(self._compute_strides())
+            new_shape.pop(dim)
+            new_strides.pop(dim)
+        else:
+            strides = self._strides if self._strides else self._compute_strides()
+            new_shape = []
+            new_strides = []
+            for s, st in zip(self._shape, strides):
+                if s != 1:
+                    new_shape.append(s)
+                    new_strides.append(st)
+        return LocompTensor(
+            shape=tuple(new_shape), strides=tuple(new_strides), dtype=self._dtype,
+            metal_buffer=self._metal_buffer, offset=self._offset,
+            base=self._base or self,
+        )
+
+    def _compute_strides(self):
+        """Compute C-contiguous strides from shape."""
+        strides = []
+        stride = 1
+        for s in reversed(self._shape):
+            strides.append(stride)
+            stride *= s
+        strides.reverse()
+        return tuple(strides)
+
     def to_metal_buffer(self, runtime):
         """Get or create the Metal buffer for this tensor."""
         if self._metal_buffer is None:
-            self._metal_buffer = runtime.allocate_buffer(self.data)
+            if self.data is not None:
+                self._metal_buffer = runtime.allocate_buffer(self.data)
+            else:
+                size_bytes = self._size * self._dtype.itemsize
+                self._metal_buffer = runtime.allocate_empty_buffer(size_bytes)
         return self._metal_buffer
 
     def _mark_dirty(self):
@@ -84,22 +268,47 @@ class LocompTensor:
             from locomp.backends.metal_runtime import get_runtime
             runtime = get_runtime()
             runtime.sync()  # wait for pending async dispatch
-            self.data = runtime.read_buffer(
-                self._metal_buffer, self._dtype, self._size
-            ).reshape(self._shape)
+            total_elems = self._offset + self._size
+            # Read the full buffer slice we need
+            raw = runtime.read_buffer(self._metal_buffer, self._dtype, total_elems)
+            if self._offset > 0:
+                raw = raw[self._offset:]
+            if self.is_contiguous():
+                self.data = raw[:self._size].reshape(self._shape)
+            else:
+                # Non-contiguous: use stride-based indexing
+                self.data = np.lib.stride_tricks.as_strided(
+                    raw, shape=self._shape,
+                    strides=tuple(s * self._dtype.itemsize for s in self._strides),
+                ).copy()
             self._gpu_dirty = False
-        return self.data
+            return self.data
+        if self.data is not None:
+            return self.data
+        # View with no data yet — read from GPU
+        if self._metal_buffer is not None:
+            from locomp.backends.metal_runtime import get_runtime
+            runtime = get_runtime()
+            runtime.sync()
+            total_elems = self._offset + self._size
+            raw = runtime.read_buffer(self._metal_buffer, self._dtype, total_elems)
+            if self._offset > 0:
+                raw = raw[self._offset:]
+            return raw[:self._size].reshape(self._shape)
+        return np.empty(self._shape, dtype=self._dtype)
 
     def __repr__(self) -> str:
-        return f"locomp.Tensor(shape={self._shape}, dtype={self._dtype}, data={self.data})"
+        return f"locomp.Tensor(shape={self._shape}, dtype={self._dtype})"
 
     def __str__(self) -> str:
-        return str(self.data)
+        return str(self.numpy())
 
     def free(self):
         """Release GPU buffer and reclaim memory budget."""
         if self._freed:
             return
+        if self._base is not None:
+            return  # Views don't own the buffer
         if self._metal_buffer is not None:
             from locomp.backends.metal_runtime import get_runtime
             runtime = get_runtime()

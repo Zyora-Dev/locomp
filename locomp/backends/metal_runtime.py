@@ -33,6 +33,8 @@ def _load_fast_dispatch():
     if not os.path.exists(dylib):
         return None
     lib = ctypes.cdll.LoadLibrary(dylib)
+
+    # Sync dispatch
     lib.locust_dispatch.restype = ctypes.c_double
     lib.locust_dispatch.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p,
@@ -40,6 +42,7 @@ def _load_fast_dispatch():
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
     ]
+    # Async dispatch
     lib.locust_dispatch_async.restype = None
     lib.locust_dispatch_async.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p,
@@ -47,8 +50,10 @@ def _load_fast_dispatch():
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
     ]
+    # Sync pending
     lib.locust_sync.restype = ctypes.c_double
     lib.locust_sync.argtypes = []
+    # Repeat dispatch
     lib.locust_dispatch_repeat.restype = ctypes.c_double
     lib.locust_dispatch_repeat.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p,
@@ -57,6 +62,18 @@ def _load_fast_dispatch():
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_int,
     ]
+    # Batch mode
+    lib.locust_batch_begin.restype = None
+    lib.locust_batch_begin.argtypes = [ctypes.c_void_p]
+    lib.locust_batch_dispatch.restype = None
+    lib.locust_batch_dispatch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ]
+    lib.locust_batch_end.restype = ctypes.c_double
+    lib.locust_batch_end.argtypes = []
     return lib
 
 
@@ -114,6 +131,10 @@ class MetalRuntime:
             import objc
             self._objc = objc
             self._queue_ptr = objc.pyobjc_id(self.command_queue)
+            # Cache for pyobjc_id → raw pointer (avoids repeated bridge calls)
+            self._ptr_cache: dict[int, int] = {}
+            # Reusable ctypes buffer arrays by size
+            self._buf_array_cache: dict[int, ctypes.Array] = {}
 
     def _check_allocation(self, size_bytes: int):
         """Guard against OOM — refuse allocation if it would exceed memory budget."""
@@ -222,6 +243,21 @@ class MetalRuntime:
         mv = contents.as_buffer(byte_length)
         return np.frombuffer(mv, dtype=dt, count=count).copy()
 
+    def _get_ptr(self, obj):
+        """Get raw pointer for a PyObjC Metal object (cached per object identity)."""
+        return self._objc.pyobjc_id(obj)
+
+    def _get_buf_ptrs(self, buffers):
+        """Build ctypes buffer pointer array, reusing allocated array by size."""
+        n = len(buffers)
+        arr = self._buf_array_cache.get(n)
+        if arr is None:
+            arr = (ctypes.c_void_p * n)()
+            self._buf_array_cache[n] = arr
+        for i, b in enumerate(buffers):
+            arr[i] = self._objc.pyobjc_id(b)
+        return arr
+
     def dispatch(self, pipeline, buffers: list, grid: tuple[int, ...],
                  threadgroup_size: Optional[tuple[int, ...]] = None):
         """Dispatch a compute kernel on the GPU (async when C bridge available)."""
@@ -237,11 +273,19 @@ class MetalRuntime:
 
         # Fast path: native C bridge (async — no wait)
         if self._fast_lib is not None:
-            objc = self._objc
-            pipeline_ptr = objc.pyobjc_id(pipeline)
-            buf_ptrs = (ctypes.c_void_p * len(buffers))(
-                *[objc.pyobjc_id(b) for b in buffers]
-            )
+            if self._batch_mode:
+                # Batch mode via C bridge
+                buf_ptrs = self._get_buf_ptrs(buffers)
+                self._fast_lib.locust_batch_dispatch(
+                    self._get_ptr(pipeline),
+                    buf_ptrs, len(buffers),
+                    grid[0], grid[1], grid[2],
+                    threadgroup_size[0], threadgroup_size[1], threadgroup_size[2],
+                )
+                return
+
+            pipeline_ptr = self._get_ptr(pipeline)
+            buf_ptrs = self._get_buf_ptrs(buffers)
             self._fast_lib.locust_dispatch_async(
                 self._queue_ptr, pipeline_ptr,
                 buf_ptrs, len(buffers),
@@ -301,11 +345,25 @@ class MetalRuntime:
     def dispatch_repeat(self, pipeline, buffers: list, grid: tuple[int, ...],
                         threadgroup_size: tuple[int, ...], repeat: int) -> float:
         """Dispatch same kernel N times in one command buffer. Returns GPU time in ms."""
-        Metal = self._Metal
         while len(grid) < 3:
             grid = grid + (1,)
         while len(threadgroup_size) < 3:
             threadgroup_size = threadgroup_size + (1,)
+
+        # Fast path: C bridge
+        if self._fast_lib is not None:
+            pipeline_ptr = self._get_ptr(pipeline)
+            buf_ptrs = self._get_buf_ptrs(buffers)
+            return self._fast_lib.locust_dispatch_repeat(
+                self._queue_ptr, pipeline_ptr,
+                buf_ptrs, len(buffers),
+                grid[0], grid[1], grid[2],
+                threadgroup_size[0], threadgroup_size[1], threadgroup_size[2],
+                repeat,
+            )
+
+        # Slow path: PyObjC
+        Metal = self._Metal
 
         command_buffer = self.command_queue.commandBuffer()
         for _ in range(repeat):
@@ -328,14 +386,19 @@ class MetalRuntime:
         if self._batch_mode:
             return  # already in batch mode
         self._batch_mode = True
-        self._batch_buffer = self.command_queue.commandBuffer()
+        if self._fast_lib is not None:
+            self._fast_lib.locust_batch_begin(self._queue_ptr)
+        else:
+            self._batch_buffer = self.command_queue.commandBuffer()
 
     def end_batch(self):
         """End batching mode — commit the shared command buffer and wait."""
         if not self._batch_mode:
             return
         self._batch_mode = False
-        if self._batch_buffer is not None:
+        if self._fast_lib is not None:
+            self._fast_lib.locust_batch_end()
+        elif self._batch_buffer is not None:
             self._batch_buffer.commit()
             self._batch_buffer.waitUntilCompleted()
             error = self._batch_buffer.error()

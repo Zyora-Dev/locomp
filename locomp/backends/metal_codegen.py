@@ -150,6 +150,53 @@ class MetalCodegen:
         lines = []
         self._nesting = 0  # Track for/if nesting depth
 
+        # Pre-declare variables that are defined inside nested scopes
+        # to avoid "undeclared identifier" errors from CSE cross-scope references.
+        # Scan: find all variables defined at depth > 0 and referenced elsewhere.
+        self._predeclared = set()
+        depth = 0
+        defined_at_depth = {}  # result_id → depth where defined
+        NO_RESULT_OPS = {OpCode.STORE, OpCode.SHARED_STORE, OpCode.BARRIER,
+                         OpCode.FOR_LOOP_END, OpCode.IF_END, OpCode.WHILE_END,
+                         OpCode.ELSE_START, OpCode.BREAK, OpCode.CONTINUE,
+                         OpCode.ATOMIC_ADD, OpCode.ATOMIC_MAX, OpCode.ATOMIC_MIN}
+        for op in self.kernel.ops:
+            if op.opcode in (OpCode.FOR_LOOP_END, OpCode.IF_END, OpCode.WHILE_END):
+                depth -= 1
+            if op.opcode not in NO_RESULT_OPS and op.result is not None:
+                defined_at_depth[op.result.id] = depth
+            if op.opcode in (OpCode.FOR_LOOP_START, OpCode.IF_START, OpCode.WHILE_START):
+                depth += 1
+
+        # Find all variable references
+        referenced_ids = set()
+        for op in self.kernel.ops:
+            for operand in op.operands:
+                referenced_ids.add(operand.id)
+
+        # Pre-declare any variable defined at depth > 0 that is referenced
+        predecl_lines = []
+        for op in self.kernel.ops:
+            if op.result is None:
+                continue
+            rid = op.result.id
+            d = defined_at_depth.get(rid, 0)
+            if d > 0 and rid in referenced_ids and op.result.aliases is None:
+                # Skip loop variables (they're declared in the for-statement)
+                if op.opcode == OpCode.FOR_LOOP_START:
+                    continue
+                # Skip shared memory refs
+                if op.opcode == OpCode.CONSTANT and "shared_mem" in op.attrs:
+                    continue
+                var_name = self._var(op.result)
+                msl_type = self._msl_type(op.result.dtype)
+                predecl_lines.append(f"{self.indent}{msl_type} {var_name};")
+                self._predeclared.add(rid)
+
+        if predecl_lines:
+            lines.extend(predecl_lines)
+            lines.append("")
+
         # Declare shared memory
         for name, (dtype, size) in self.kernel.shared_mem.items():
             msl_type = dtype.to_msl()
@@ -180,15 +227,44 @@ class MetalCodegen:
             line = self._gen_op(op)
             if line:
                 if isinstance(line, list):
-                    lines.extend(f"{cur_indent}{l}" for l in line)
+                    for l in line:
+                        full = f"{cur_indent}{l}"
+                        if op.result is not None:
+                            full = self._strip_type_prefix(full, op.result.id)
+                        lines.append(full)
                 else:
-                    lines.append(f"{cur_indent}{line}")
+                    full = f"{cur_indent}{line}"
+                    if op.result is not None:
+                        full = self._strip_type_prefix(full, op.result.id)
+                    lines.append(full)
 
             # Opening braces increment nesting
             if op.opcode in (OpCode.FOR_LOOP_START, OpCode.IF_START, OpCode.WHILE_START):
                 self._nesting += 1
 
         return lines
+
+    def _decl(self, op_result: 'IRValue', rhs: str) -> str:
+        """Emit declaration or assignment depending on pre-declaration status."""
+        var = self._var(op_result)
+        if op_result.id in self._predeclared:
+            return f"{var} = {rhs};"
+        msl_type = self._msl_type(op_result.dtype)
+        return f"{msl_type} {var} = {rhs};"
+
+    def _strip_type_prefix(self, line: str, result_id: int) -> str:
+        """For pre-declared variables, strip the type prefix from generated code."""
+        if result_id not in self._predeclared:
+            return line
+        # Strip leading whitespace, find type prefix, remove it
+        stripped = line.lstrip()
+        for prefix in ("float ", "int ", "half ", "bool ", "uint ", "short ",
+                       "ushort ", "uchar ", "char "):
+            if stripped.startswith(prefix):
+                # Replace "type var = ..." with "var = ..."
+                indent = line[:len(line) - len(stripped)]
+                return indent + stripped[len(prefix):]
+        return line
 
     def _gen_op(self, op: IROp) -> str | list[str] | None:
         """Generate MSL code for a single IR operation."""
