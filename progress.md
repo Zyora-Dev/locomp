@@ -627,6 +627,8 @@ Enhanced `LocompTensor` in `api.py`:
 | `silu_mul_kernel` | SiLU(gate) * up (MLP activation) | 1/elem |
 | `rope_kernel` | Rotary position embeddings (half-half format) | heads×HD/2 |
 | `gqa_attn_kernel` | Grouped-query attention with 3-phase softmax | 64 |
+| `kv_cache_update_kernel` | Scatter K/V into cache at position (GPU, no CPU sync) | 1/elem |
+| `add_inplace_kernel` | In-place residual connections (A += B) | 1/elem |
 | `add_kernel` | Residual connections | 1/elem |
 | `copy_kernel` | Buffer copy | 1/elem |
 | `embed_kernel` | Token embedding lookup | seq×dim |
@@ -635,12 +637,22 @@ Enhanced `LocompTensor` in `api.py`:
 ```
 Prompt: "The meaning of life is"
 Output: "to be found in the meaning of the universe."
-Prefill: 3.0 tok/s (5 tokens)
-Decode:  5.8 tok/s (30 tokens)
+Prefill: 4.1 tok/s (5 tokens)
+Decode:  7.9 tok/s (30 tokens)
+
+Prompt: "Once upon a time"
+Output: ", there was a little girl named Lily..."
+Decode:  7.6 tok/s
+
+Prompt: "Python is a programming language that"
+Output: "allows you to write programs in a structured way..."
+Decode:  7.1 tok/s
 ```
+
+**Optimizations applied**:
+1. **GPU KV cache kernel**: Replaced NumPy round-trip (GPU→CPU→GPU, 60× per token) with `kv_cache_update_kernel` — stays entirely on GPU. ~2× prefill speedup, 1.3× decode speedup.
+2. **In-place residual add**: Replaced `add + copy` kernel pair with single `add_inplace_kernel` — halves dispatch count for residuals.
 
 **Bugs fixed during bring-up**:
 1. **RoPE rotation format**: Changed from interleaved pairs `(q[2d], q[2d+1])` to half-half `(q[d], q[d+HD/2])` — Llama/SmolLM2 uses `rotate_half` not interleaved
 2. **KV cache stride**: Attention kernel was using `SEQ_LEN` stride instead of `MAX_SEQ` stride — kv_head > 0 read garbage when seq_len < max_seq
-
-**Current bottleneck**: KV cache updates use NumPy round-trip (GPU→CPU→GPU) per layer. A GPU kernel for position-indexed cache update would eliminate this.
