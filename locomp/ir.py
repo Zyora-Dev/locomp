@@ -90,6 +90,13 @@ class OpCode(Enum):
     MOD = auto()
     NEG = auto()
 
+    # Bitwise
+    BIT_AND = auto()
+    BIT_OR = auto()
+    BIT_XOR = auto()
+    LSHIFT = auto()
+    RSHIFT = auto()
+
     # Math functions
     SQRT = auto()
     EXP = auto()

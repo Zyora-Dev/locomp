@@ -272,7 +272,9 @@ class MetalCodegen:
             else:
                 return f"{msl_type} {result_var} = {val};"
 
-        elif op.opcode in (OpCode.ADD, OpCode.SUB, OpCode.MUL, OpCode.DIV, OpCode.MOD):
+        elif op.opcode in (OpCode.ADD, OpCode.SUB, OpCode.MUL, OpCode.DIV, OpCode.MOD,
+                          OpCode.BIT_AND, OpCode.BIT_OR, OpCode.BIT_XOR,
+                          OpCode.LSHIFT, OpCode.RSHIFT):
             return self._gen_arithmetic(op)
 
         elif op.opcode == OpCode.COPY:
@@ -518,7 +520,9 @@ class MetalCodegen:
         """Generate arithmetic, with special handling for pointer + offset."""
         op_sym = {
             OpCode.ADD: "+", OpCode.SUB: "-", OpCode.MUL: "*",
-            OpCode.DIV: "/", OpCode.MOD: "%"
+            OpCode.DIV: "/", OpCode.MOD: "%",
+            OpCode.BIT_AND: "&", OpCode.BIT_OR: "|", OpCode.BIT_XOR: "^",
+            OpCode.LSHIFT: "<<", OpCode.RSHIFT: ">>",
         }[op.opcode]
         result_var = self._var(op.result)
         lhs, rhs = op.operands[0], op.operands[1]

@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from locomp.frontend import compile_kernel, constexpr, Tensor, Float16
+from locomp.frontend import compile_kernel, constexpr, Tensor, Float16, UInt8, Int8
 from locomp.ir import IRKernel
 from locomp.optimizer import optimize
 from locomp.backends.metal_codegen import compile_to_metal
@@ -26,12 +26,14 @@ from locomp.backends.metal_codegen import compile_to_metal
 constexpr = constexpr
 Tensor = Tensor
 Float16 = Float16
+UInt8 = UInt8
+Int8 = Int8
 
 
 class LocompTensor:
     """A GPU-backed tensor. Wraps a Metal buffer + numpy array."""
 
-    _SUPPORTED_DTYPES = {np.float16, np.float32, np.float64}
+    _SUPPORTED_DTYPES = {np.float16, np.float32, np.float64, np.int8, np.uint8}
 
     def __init__(self, data: np.ndarray, metal_buffer=None):
         if data.dtype.type not in self._SUPPORTED_DTYPES:

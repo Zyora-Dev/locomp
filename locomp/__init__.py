@@ -66,6 +66,8 @@ from locomp.api import (
     constexpr,
     Tensor,
     Float16,
+    UInt8,
+    Int8,
 )
 
 __version__ = "0.1.0"
@@ -134,4 +136,6 @@ __all__ = [
     "constexpr",
     "Tensor",
     "Float16",
+    "UInt8",
+    "Int8",
 ]

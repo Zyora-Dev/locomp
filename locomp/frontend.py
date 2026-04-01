@@ -30,6 +30,16 @@ class Float16:
     pass
 
 
+class UInt8:
+    """Type annotation for uint8 tensor/pointer kernel parameters."""
+    pass
+
+
+class Int8:
+    """Type annotation for int8 tensor/pointer kernel parameters."""
+    pass
+
+
 # --- AST → IR Compiler ---
 
 _BINOP_MAP = {
@@ -39,6 +49,11 @@ _BINOP_MAP = {
     ast.Div: OpCode.DIV,
     ast.FloorDiv: OpCode.DIV,
     ast.Mod: OpCode.MOD,
+    ast.BitAnd: OpCode.BIT_AND,
+    ast.BitOr: OpCode.BIT_OR,
+    ast.BitXor: OpCode.BIT_XOR,
+    ast.LShift: OpCode.LSHIFT,
+    ast.RShift: OpCode.RSHIFT,
 }
 
 _CMPOP_MAP = {
@@ -98,6 +113,16 @@ class KernelCompiler(ast.NodeVisitor):
                 self._var_depth[name] = 0
             elif ann is Float16 or (isinstance(ann, type) and issubclass(ann, Float16)):
                 val = self.kernel.new_value(name, IRType.FLOAT16, is_pointer=True)
+                self.kernel.params.append(val)
+                self.scope[name] = val
+                self._var_depth[name] = 0
+            elif ann is UInt8 or (isinstance(ann, type) and issubclass(ann, UInt8)):
+                val = self.kernel.new_value(name, IRType.UINT8, is_pointer=True)
+                self.kernel.params.append(val)
+                self.scope[name] = val
+                self._var_depth[name] = 0
+            elif ann is Int8 or (isinstance(ann, type) and issubclass(ann, Int8)):
+                val = self.kernel.new_value(name, IRType.INT8, is_pointer=True)
                 self.kernel.params.append(val)
                 self.scope[name] = val
                 self._var_depth[name] = 0
@@ -478,10 +503,14 @@ class KernelCompiler(ast.NodeVisitor):
             smem_dtype = IRType.FLOAT32
             if len(node.args) > 1:
                 dtype_node = node.args[1]
-                if isinstance(dtype_node, ast.Attribute) and dtype_node.attr == "Float16":
-                    smem_dtype = IRType.FLOAT16
-                elif isinstance(dtype_node, ast.Attribute) and dtype_node.attr == "float16":
-                    smem_dtype = IRType.FLOAT16
+                if isinstance(dtype_node, ast.Attribute):
+                    _smem_dtype_map = {
+                        "Float16": IRType.FLOAT16, "float16": IRType.FLOAT16,
+                        "Int32": IRType.INT32, "int32": IRType.INT32,
+                        "UInt8": IRType.UINT8, "uint8": IRType.UINT8,
+                    }
+                    if dtype_node.attr in _smem_dtype_map:
+                        smem_dtype = _smem_dtype_map[dtype_node.attr]
             name = f"smem_{len(self.kernel.shared_mem)}"
             self.kernel.shared_mem[name] = (smem_dtype, size)
             shape = (size,) if isinstance(size, int) else None
@@ -515,6 +544,26 @@ class KernelCompiler(ast.NodeVisitor):
             val = self._visit_expr(node.args[2])
             result = self.kernel.new_value("sstore", IRType.BOOL)
             self.kernel.add_op(OpCode.SHARED_STORE, result, [arr, idx, val])
+            return result
+
+        # locomp.cast(val, "dtype_string") — explicit type cast
+        if func_name == "cast":
+            arg = self._visit_expr(node.args[0])
+            dtype_node = node.args[1]
+            _cast_dtype_map = {
+                "float32": IRType.FLOAT32, "float16": IRType.FLOAT16,
+                "int32": IRType.INT32, "int8": IRType.INT8,
+                "uint8": IRType.UINT8, "uint32": IRType.UINT32,
+            }
+            if isinstance(dtype_node, ast.Constant):
+                type_name = dtype_node.value
+            elif isinstance(dtype_node, ast.Attribute):
+                type_name = dtype_node.attr
+            else:
+                raise ValueError(f"Cast type must be a string, got {ast.dump(dtype_node)}")
+            target_dtype = _cast_dtype_map[type_name]
+            result = self.kernel.new_value("cast", target_dtype)
+            self.kernel.add_op(OpCode.CAST, result, [arg])
             return result
 
         # locomp.load(ptr, mask=...)
