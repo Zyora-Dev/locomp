@@ -40,6 +40,8 @@ print(o.numpy())  # [6. 8. 10. 12.]
 pip install locomp
 ```
 
+**PyPI**: https://pypi.org/project/locomp/
+
 Requirements: macOS with Apple Silicon (M1/M2/M3/M4), Python 3.10+.
 
 ## How It Works
