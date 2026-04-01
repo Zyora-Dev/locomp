@@ -27,9 +27,24 @@ def _check_metal_available():
 
 
 def _load_fast_dispatch():
-    """Load the native C bridge for fast Metal dispatch."""
-    dylib = os.path.join(os.path.dirname(__file__), "..", "_native", "fast_dispatch.dylib")
-    dylib = os.path.abspath(dylib)
+    """Load the native C bridge for fast Metal dispatch. Auto-compiles from source if needed."""
+    native_dir = os.path.join(os.path.dirname(__file__), "..", "_native")
+    native_dir = os.path.abspath(native_dir)
+    dylib = os.path.join(native_dir, "fast_dispatch.dylib")
+    src = os.path.join(native_dir, "fast_dispatch.m")
+
+    if not os.path.exists(dylib) and os.path.exists(src):
+        # Auto-compile from source
+        import subprocess
+        try:
+            subprocess.run(
+                ["clang", "-O2", "-shared", "-o", dylib, src,
+                 "-framework", "Metal", "-framework", "Foundation"],
+                check=True, capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None  # No compiler available, fall back to PyObjC
+
     if not os.path.exists(dylib):
         return None
     lib = ctypes.cdll.LoadLibrary(dylib)

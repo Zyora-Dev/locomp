@@ -46,6 +46,9 @@ Documentation = "https://github.com/Zyora-Dev/locomp/wiki"
 [tool.setuptools.packages.find]
 include = ["locomp*"]
 
+[tool.setuptools.package-data]
+"locomp._native" = ["*.m"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
