@@ -31,3 +31,5 @@ env/
 # Internal dev notes
 progress.md
 roadmap.md
+debug_ir.py
+_test_tensor_ops.py
