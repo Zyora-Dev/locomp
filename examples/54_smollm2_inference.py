@@ -14,12 +14,13 @@ import json
 import numpy as np
 import locomp
 from safetensors import safe_open
+from huggingface_hub import hf_hub_download
 
 # =========================================================================
 # Model config
 # =========================================================================
-MODEL_PATH = "/Users/redfoxhotels/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/snapshots/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/model.safetensors"
-TOKENIZER_PATH = "/Users/redfoxhotels/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M/snapshots/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/tokenizer.json"
+MODEL_PATH = hf_hub_download("HuggingFaceTB/SmolLM2-135M", "model.safetensors")
+TOKENIZER_PATH = hf_hub_download("HuggingFaceTB/SmolLM2-135M", "tokenizer.json")
 
 HIDDEN = 576
 N_HEADS = 9
