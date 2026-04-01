@@ -19,7 +19,7 @@ from locomp.ir import IRKernel, IROp, IRType, IRValue, OpCode
 class MetalCodegen:
     """Generates Metal Shading Language from Locust IR."""
 
-    def __init__(self, kernel: IRKernel, constexpr_values: dict[str, int] | None = None):
+    def __init__(self, kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None):
         self.kernel = kernel
         self.indent = "    "
         self._var_names: dict[int, str] = {}
@@ -99,7 +99,11 @@ class MetalCodegen:
                 # Constexpr param — check if we can inline it
                 if param.name in self._constexpr_values:
                     # Inline as literal: set var name to the literal value
-                    self._var_names[param.id] = str(self._constexpr_values[param.name])
+                    val = self._constexpr_values[param.name]
+                    if isinstance(val, float):
+                        self._var_names[param.id] = f"{val}f"
+                    else:
+                        self._var_names[param.id] = str(val)
                     # Don't add to signature or allocate a buffer slot
                 else:
                     params.append(
@@ -634,7 +638,7 @@ class MetalCodegen:
         return self._param_buffer_map
 
 
-def compile_to_metal(kernel: IRKernel, constexpr_values: dict[str, int] | None = None) -> tuple[str, dict[int, int]]:
+def compile_to_metal(kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None) -> tuple[str, dict[int, int]]:
     """Compile IR kernel to MSL source code. Returns (msl_source, buffer_map)."""
     codegen = MetalCodegen(kernel, constexpr_values=constexpr_values)
     source = codegen.generate()

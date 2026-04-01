@@ -226,7 +226,11 @@ class _KernelCall:
             if param.is_pointer:
                 tensor_args.append(arg)
             else:
-                constexpr_values[param.name] = int(arg)
+                # Preserve int vs float type for correct MSL codegen
+                if isinstance(arg, float):
+                    constexpr_values[param.name] = float(arg)
+                else:
+                    constexpr_values[param.name] = int(arg)
 
         # Get or create specialized pipeline for these constexpr values
         constexpr_key = tuple(sorted(constexpr_values.items()))
