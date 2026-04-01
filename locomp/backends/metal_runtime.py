@@ -63,7 +63,7 @@ def _load_fast_dispatch():
 class MetalRuntime:
     """Runtime for executing compiled MSL kernels on Apple GPU."""
 
-    def __init__(self):
+    def __init__(self, device_index: int = 0):
         _check_metal_available()
 
         import Metal
@@ -72,8 +72,18 @@ class MetalRuntime:
         self._Metal = Metal
         self._MPS = MPS
 
-        # Get default GPU device
-        self.device = Metal.MTLCreateSystemDefaultDevice()
+        # Device selection: pick by index from available devices
+        all_devices = Metal.MTLCopyAllDevices()
+        if not all_devices or len(all_devices) == 0:
+            # Fallback to default device
+            self.device = Metal.MTLCreateSystemDefaultDevice()
+        elif device_index < len(all_devices):
+            self.device = all_devices[device_index]
+        else:
+            raise RuntimeError(
+                f"GPU device index {device_index} out of range. "
+                f"Available devices: {len(all_devices)}"
+            )
         if self.device is None:
             raise RuntimeError("No Metal-compatible GPU found")
 
@@ -92,6 +102,11 @@ class MetalRuntime:
         self._pipeline_cache: dict[str, any] = {}
         # Cache int buffers to avoid repeated allocation
         self._int_buffer_cache: dict[int, any] = {}
+
+        # Command buffer batching state
+        self._batch_mode = False
+        self._batch_buffer = None
+        self._batch_encoder = None
 
         # Native C bridge for fast dispatch
         self._fast_lib = _load_fast_dispatch()
@@ -237,8 +252,20 @@ class MetalRuntime:
             self._last_gpu_end = 0.0
             return
 
-        # Slow path: PyObjC (synchronous)
+        # Slow path: PyObjC (synchronous or batch mode)
         Metal = self._Metal
+
+        if self._batch_mode and self._batch_buffer is not None:
+            # Batch mode: reuse shared command buffer, don't commit yet
+            encoder = self._batch_buffer.computeCommandEncoder()
+            encoder.setComputePipelineState_(pipeline)
+            for i, buf in enumerate(buffers):
+                encoder.setBuffer_offset_atIndex_(buf, 0, i)
+            grid_size = Metal.MTLSizeMake(*grid)
+            tg_size = Metal.MTLSizeMake(*threadgroup_size)
+            encoder.dispatchThreadgroups_threadsPerThreadgroup_(grid_size, tg_size)
+            encoder.endEncoding()
+            return
 
         command_buffer = self.command_queue.commandBuffer()
         encoder = command_buffer.computeCommandEncoder()
@@ -296,6 +323,26 @@ class MetalRuntime:
         gpu_ms = (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()) * 1000
         return gpu_ms / repeat
 
+    def begin_batch(self):
+        """Start batching mode — multiple dispatches share one command buffer."""
+        if self._batch_mode:
+            return  # already in batch mode
+        self._batch_mode = True
+        self._batch_buffer = self.command_queue.commandBuffer()
+
+    def end_batch(self):
+        """End batching mode — commit the shared command buffer and wait."""
+        if not self._batch_mode:
+            return
+        self._batch_mode = False
+        if self._batch_buffer is not None:
+            self._batch_buffer.commit()
+            self._batch_buffer.waitUntilCompleted()
+            error = self._batch_buffer.error()
+            if error is not None:
+                raise RuntimeError(f"Metal batch execution failed: {error}")
+            self._batch_buffer = None
+
 
 # Global runtime instance (lazy init)
 _runtime: Optional[MetalRuntime] = None
@@ -307,3 +354,19 @@ def get_runtime() -> MetalRuntime:
     if _runtime is None:
         _runtime = MetalRuntime()
     return _runtime
+
+
+def set_device(index: int = 0):
+    """Switch to a different GPU device. Resets the runtime."""
+    global _runtime
+    _runtime = MetalRuntime(device_index=index)
+
+
+def list_devices() -> list[str]:
+    """List all available Metal GPU devices."""
+    _check_metal_available()
+    import Metal
+    devices = Metal.MTLCopyAllDevices()
+    if not devices:
+        return []
+    return [d.name() for d in devices]

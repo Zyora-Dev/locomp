@@ -40,6 +40,16 @@ class Int8:
     pass
 
 
+class Int32:
+    """Type annotation for int32 tensor/pointer kernel parameters."""
+    pass
+
+
+class Bool:
+    """Type annotation for bool tensor/pointer kernel parameters."""
+    pass
+
+
 # --- AST → IR Compiler ---
 
 _BINOP_MAP = {
@@ -126,6 +136,16 @@ class KernelCompiler(ast.NodeVisitor):
                 self.kernel.params.append(val)
                 self.scope[name] = val
                 self._var_depth[name] = 0
+            elif ann is Int32 or (isinstance(ann, type) and issubclass(ann, Int32)):
+                val = self.kernel.new_value(name, IRType.INT32, is_pointer=True)
+                self.kernel.params.append(val)
+                self.scope[name] = val
+                self._var_depth[name] = 0
+            elif ann is Bool or (isinstance(ann, type) and issubclass(ann, Bool)):
+                val = self.kernel.new_value(name, IRType.BOOL, is_pointer=True)
+                self.kernel.params.append(val)
+                self.scope[name] = val
+                self._var_depth[name] = 0
             else:
                 val = self.kernel.new_value(name, IRType.FLOAT32, is_pointer=True)
                 self.kernel.params.append(val)
@@ -146,14 +166,41 @@ class KernelCompiler(ast.NodeVisitor):
             self._visit_aug_assign(node)
         elif isinstance(node, ast.For):
             self._visit_for(node)
+        elif isinstance(node, ast.While):
+            self._visit_while(node)
         elif isinstance(node, ast.If):
             self._visit_if(node)
+        elif isinstance(node, ast.Break):
+            self._visit_break(node)
+        elif isinstance(node, ast.Continue):
+            self._visit_continue(node)
         else:
-            raise NotImplementedError(f"Statement type not supported: {type(node).__name__}")
+            lineno = getattr(node, 'lineno', '?')
+            raise NotImplementedError(
+                f"Statement not supported: {type(node).__name__} (line {lineno})"
+            )
 
     def _visit_assign(self, node: ast.Assign):
         assert len(node.targets) == 1, "Only single-target assignment supported"
         target = node.targets[0]
+
+        # Tuple unpacking: a, b = expr1, expr2
+        if isinstance(target, ast.Tuple):
+            if isinstance(node.value, ast.Tuple):
+                assert len(target.elts) == len(node.value.elts), \
+                    f"Tuple unpack mismatch: {len(target.elts)} targets, {len(node.value.elts)} values"
+                for t, v in zip(target.elts, node.value.elts):
+                    assert isinstance(t, ast.Name), "Only simple name targets in tuple unpack"
+                    value = self._visit_expr(v)
+                    self.scope[t.id] = value
+                    self._var_depth[t.id] = self._loop_depth
+                return
+            else:
+                lineno = getattr(node, 'lineno', '?')
+                raise NotImplementedError(
+                    f"Tuple unpacking only supported with tuple RHS (line {lineno})"
+                )
+
         assert isinstance(target, ast.Name), "Only simple name assignment supported"
         value = self._visit_expr(node.value)
 
@@ -244,7 +291,7 @@ class KernelCompiler(ast.NodeVisitor):
         self._pre_loop_vars.pop()
 
     def _visit_if(self, node: ast.If):
-        """Handle: if condition: body"""
+        """Handle: if condition: body [elif ...: body] [else: body]"""
         cond = self._visit_expr(node.test)
         start_marker = self.kernel.new_value("if", IRType.BOOL)
         self.kernel.add_op(OpCode.IF_START, start_marker, [cond])
@@ -252,8 +299,53 @@ class KernelCompiler(ast.NodeVisitor):
         for stmt in node.body:
             self._visit_stmt(stmt)
 
+        if node.orelse:
+            else_marker = self.kernel.new_value("else", IRType.BOOL)
+            self.kernel.add_op(OpCode.ELSE_START, else_marker)
+            for stmt in node.orelse:
+                self._visit_stmt(stmt)
+
         end_marker = self.kernel.new_value("endif", IRType.BOOL)
         self.kernel.add_op(OpCode.IF_END, end_marker)
+
+    def _visit_while(self, node: ast.While):
+        """Handle: while condition: body"""
+        start_marker = self.kernel.new_value("while", IRType.BOOL)
+        # Emit a dummy cond first — the real cond is re-evaluated each iteration
+        self.kernel.add_op(OpCode.WHILE_START, start_marker, attrs={"has_cond": True})
+
+        self._pre_loop_vars.append(set(self.scope.keys()))
+        self._loop_depth += 1
+
+        # The condition is evaluated inside the loop body as the break test
+        cond = self._visit_expr(node.test)
+        # Negate: if NOT cond → break
+        neg_cond = self.kernel.new_value("ncond", IRType.BOOL)
+        zero = self.kernel.new_value("const", IRType.BOOL)
+        self.kernel.add_op(OpCode.CONSTANT, zero, attrs={"value": 0})
+        self.kernel.add_op(OpCode.CMP_EQ, neg_cond, [cond, zero])
+        break_if = self.kernel.new_value("if", IRType.BOOL)
+        self.kernel.add_op(OpCode.IF_START, break_if, [neg_cond])
+        break_marker = self.kernel.new_value("break", IRType.BOOL)
+        self.kernel.add_op(OpCode.BREAK, break_marker)
+        break_endif = self.kernel.new_value("endif", IRType.BOOL)
+        self.kernel.add_op(OpCode.IF_END, break_endif)
+
+        for stmt in node.body:
+            self._visit_stmt(stmt)
+
+        end_marker = self.kernel.new_value("endwhile", IRType.BOOL)
+        self.kernel.add_op(OpCode.WHILE_END, end_marker)
+        self._loop_depth -= 1
+        self._pre_loop_vars.pop()
+
+    def _visit_break(self, node: ast.Break):
+        marker = self.kernel.new_value("break", IRType.BOOL)
+        self.kernel.add_op(OpCode.BREAK, marker)
+
+    def _visit_continue(self, node: ast.Continue):
+        marker = self.kernel.new_value("continue", IRType.BOOL)
+        self.kernel.add_op(OpCode.CONTINUE, marker)
 
     def _visit_expr_stmt(self, node: ast.Expr):
         self._visit_expr(node.value)
@@ -272,7 +364,10 @@ class KernelCompiler(ast.NodeVisitor):
         elif isinstance(node, ast.Call):
             return self._visit_call(node)
         else:
-            raise NotImplementedError(f"Expression type not supported: {type(node).__name__}")
+            lineno = getattr(node, 'lineno', '?')
+            raise NotImplementedError(
+                f"Expression not supported: {type(node).__name__} (line {lineno})"
+            )
 
     def _visit_name(self, node: ast.Name) -> IRValue:
         if node.id in self.scope:
@@ -644,7 +739,35 @@ class KernelCompiler(ast.NodeVisitor):
             self.kernel.add_op(opcode, result, [arg])
             return result
 
-        raise NotImplementedError(f"Unknown function call: {func_name}")
+        # locomp.atomic_add(ptr, val) — returns old value
+        if func_name == "atomic_add":
+            ptr = self._visit_expr(node.args[0])
+            val = self._visit_expr(node.args[1])
+            load_dtype = self._resolve_ptr_dtype(ptr)
+            result = self.kernel.new_value("aold", load_dtype)
+            self.kernel.add_op(OpCode.ATOMIC_ADD, result, [ptr, val])
+            return result
+
+        # locomp.atomic_max(ptr, val) — returns old value
+        if func_name == "atomic_max":
+            ptr = self._visit_expr(node.args[0])
+            val = self._visit_expr(node.args[1])
+            load_dtype = self._resolve_ptr_dtype(ptr)
+            result = self.kernel.new_value("aold", load_dtype)
+            self.kernel.add_op(OpCode.ATOMIC_MAX, result, [ptr, val])
+            return result
+
+        # locomp.atomic_min(ptr, val) — returns old value
+        if func_name == "atomic_min":
+            ptr = self._visit_expr(node.args[0])
+            val = self._visit_expr(node.args[1])
+            load_dtype = self._resolve_ptr_dtype(ptr)
+            result = self.kernel.new_value("aold", load_dtype)
+            self.kernel.add_op(OpCode.ATOMIC_MIN, result, [ptr, val])
+            return result
+
+        lineno = getattr(node, 'lineno', '?')
+        raise NotImplementedError(f"Unknown function call: {func_name} (line {lineno})")
 
     def _resolve_call_name(self, node: ast.expr) -> str:
         """Resolve function name from call node — handles locomp.foo and bare foo."""

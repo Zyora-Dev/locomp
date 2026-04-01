@@ -16,6 +16,8 @@ from locomp.ir import IRKernel, IROp, IRValue, OpCode, IRType
 def optimize(kernel: IRKernel, target: str = "metal") -> IRKernel:
     """Run all optimization passes on the kernel."""
     kernel = constant_fold(kernel)
+    kernel = strength_reduce(kernel)
+    kernel = common_subexpression_eliminate(kernel)
     kernel = dead_code_eliminate(kernel)
     kernel = infer_types(kernel)
     return kernel
@@ -62,6 +64,133 @@ def constant_fold(kernel: IRKernel) -> IRKernel:
     return kernel
 
 
+def strength_reduce(kernel: IRKernel) -> IRKernel:
+    """Replace expensive operations with cheaper equivalents."""
+    constants: dict[int, any] = {}
+    for op in kernel.ops:
+        if op.opcode == OpCode.CONSTANT:
+            constants[op.result.id] = op.attrs["value"]
+
+    # Remove alias targets from constants — they are mutable accumulators
+    # whose initial constant value is not valid for all iterations
+    alias_targets = {op.result.aliases for op in kernel.ops if op.result.aliases is not None}
+    for target_id in alias_targets:
+        constants.pop(target_id, None)
+
+    new_ops = []
+    for op in kernel.ops:
+        # Skip mutable accumulator updates — they need the alias chain intact
+        if op.result.aliases is not None:
+            new_ops.append(op)
+            continue
+
+        if op.opcode == OpCode.MUL and len(op.operands) == 2:
+            a, b = op.operands
+            # x * 2 → x + x
+            if b.id in constants and constants[b.id] == 2:
+                new_ops.append(IROp(opcode=OpCode.ADD, result=op.result,
+                                    operands=[a, a], attrs={}))
+                continue
+            if a.id in constants and constants[a.id] == 2:
+                new_ops.append(IROp(opcode=OpCode.ADD, result=op.result,
+                                    operands=[b, b], attrs={}))
+                continue
+            # x * 1 → x (identity via COPY)
+            if b.id in constants and constants[b.id] == 1:
+                new_ops.append(IROp(opcode=OpCode.COPY, result=op.result,
+                                    operands=[a], attrs={}))
+                continue
+            if a.id in constants and constants[a.id] == 1:
+                new_ops.append(IROp(opcode=OpCode.COPY, result=op.result,
+                                    operands=[b], attrs={}))
+                continue
+            # x * 0 → 0
+            if (b.id in constants and constants[b.id] == 0) or \
+               (a.id in constants and constants[a.id] == 0):
+                new_ops.append(IROp(opcode=OpCode.CONSTANT, result=op.result,
+                                    operands=[], attrs={"value": 0}))
+                continue
+        elif op.opcode == OpCode.ADD and len(op.operands) == 2:
+            a, b = op.operands
+            # x + 0 → x
+            if b.id in constants and constants[b.id] == 0:
+                new_ops.append(IROp(opcode=OpCode.COPY, result=op.result,
+                                    operands=[a], attrs={}))
+                continue
+            if a.id in constants and constants[a.id] == 0:
+                new_ops.append(IROp(opcode=OpCode.COPY, result=op.result,
+                                    operands=[b], attrs={}))
+                continue
+        elif op.opcode == OpCode.SUB and len(op.operands) == 2:
+            a, b = op.operands
+            # x - 0 → x
+            if b.id in constants and constants[b.id] == 0:
+                new_ops.append(IROp(opcode=OpCode.COPY, result=op.result,
+                                    operands=[a], attrs={}))
+                continue
+
+        new_ops.append(op)
+
+    kernel.ops = new_ops
+    return kernel
+
+
+def common_subexpression_eliminate(kernel: IRKernel) -> IRKernel:
+    """Eliminate redundant computations — reuse existing results."""
+    # Map: (opcode, operand_ids_tuple, frozen_attrs) → first result IRValue
+    expr_map: dict[tuple, IRValue] = {}
+    # Map: old result id → replacement IRValue
+    replacements: dict[int, IRValue] = {}
+
+    # Ops that are safe to CSE (pure, no side effects, no control flow)
+    CSE_SAFE = {
+        OpCode.ADD, OpCode.SUB, OpCode.MUL, OpCode.DIV, OpCode.MOD,
+        OpCode.BIT_AND, OpCode.BIT_OR, OpCode.BIT_XOR, OpCode.LSHIFT, OpCode.RSHIFT,
+        OpCode.SQRT, OpCode.EXP, OpCode.LOG, OpCode.ABS, OpCode.TANH,
+        OpCode.SIN, OpCode.COS, OpCode.ASIN, OpCode.ACOS, OpCode.ATAN,
+        OpCode.SINH, OpCode.COSH, OpCode.EXP2, OpCode.LOG2, OpCode.LOG10,
+        OpCode.RSQRT, OpCode.CEIL, OpCode.FLOOR, OpCode.ROUND,
+        OpCode.SIGMOID, OpCode.FMA, OpCode.POW, OpCode.NEG,
+        OpCode.CMP_LT, OpCode.CMP_LE, OpCode.CMP_GT, OpCode.CMP_GE,
+        OpCode.CMP_EQ, OpCode.CMP_NE,
+        OpCode.MAX, OpCode.MIN, OpCode.CLAMP, OpCode.COPYSIGN, OpCode.FMOD, OpCode.STEP,
+        OpCode.CAST, OpCode.PTR_ADD,
+    }
+
+    new_ops = []
+    for op in kernel.ops:
+        # Remap operands through replacements
+        remapped_operands = []
+        for operand in op.operands:
+            if operand.id in replacements:
+                remapped_operands.append(replacements[operand.id])
+            else:
+                remapped_operands.append(operand)
+        op.operands = remapped_operands
+
+        # Skip aliased ops — mutable accumulators need their own results
+        if op.result.aliases is not None:
+            new_ops.append(op)
+            continue
+
+        if op.opcode in CSE_SAFE:
+            operand_ids = tuple(o.id for o in op.operands)
+            frozen_attrs = tuple(sorted(op.attrs.items())) if op.attrs else ()
+            key = (op.opcode, operand_ids, frozen_attrs)
+
+            if key in expr_map:
+                # This expression was already computed — replace with existing
+                replacements[op.result.id] = expr_map[key]
+                continue  # drop this op
+            else:
+                expr_map[key] = op.result
+
+        new_ops.append(op)
+
+    kernel.ops = new_ops
+    return kernel
+
+
 def dead_code_eliminate(kernel: IRKernel) -> IRKernel:
     """Remove operations whose results are never used."""
     # Collect all referenced value IDs
@@ -71,8 +200,11 @@ def dead_code_eliminate(kernel: IRKernel) -> IRKernel:
     SIDE_EFFECT_OPS = {
         OpCode.STORE, OpCode.SHARED_STORE, OpCode.BARRIER,
         OpCode.FOR_LOOP_START, OpCode.FOR_LOOP_END,
-        OpCode.IF_START, OpCode.IF_END,
+        OpCode.WHILE_START, OpCode.WHILE_END,
+        OpCode.IF_START, OpCode.ELSE_START, OpCode.IF_END,
+        OpCode.BREAK, OpCode.CONTINUE,
         OpCode.SIMDGROUP_MATRIX_STORE,
+        OpCode.ATOMIC_ADD, OpCode.ATOMIC_MAX, OpCode.ATOMIC_MIN,
     }
 
     for op in kernel.ops:
@@ -84,6 +216,7 @@ def dead_code_eliminate(kernel: IRKernel) -> IRKernel:
         # they update a variable used in subsequent loop iterations via MSL aliasing
         if op.result.aliases is not None:
             used_ids.add(op.result.id)
+            used_ids.add(op.result.aliases)  # keep the alias target alive
             for operand in op.operands:
                 used_ids.add(operand.id)
 

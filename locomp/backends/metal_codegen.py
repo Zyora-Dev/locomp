@@ -19,7 +19,8 @@ from locomp.ir import IRKernel, IROp, IRType, IRValue, OpCode
 class MetalCodegen:
     """Generates Metal Shading Language from Locust IR."""
 
-    def __init__(self, kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None):
+    def __init__(self, kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None,
+                 use_function_constants: bool = False):
         self.kernel = kernel
         self.indent = "    "
         self._var_names: dict[int, str] = {}
@@ -30,6 +31,10 @@ class MetalCodegen:
         self._ptr_exprs: dict[int, tuple[str, str, bool]] = {}
         # Constexpr values to inline as literals (param_name → value)
         self._constexpr_values = constexpr_values or {}
+        # Use Metal function_constant for constexpr (alternative to inlining)
+        self._use_function_constants = use_function_constants
+        self._function_constant_index = 0
+        self._function_constant_map: dict[str, int] = {}  # param_name → fc_index
 
     def generate(self) -> str:
         """Generate complete MSL source code."""
@@ -44,7 +49,14 @@ class MetalCodegen:
             lines.append("#include <metal_simdgroup_matrix>")
         lines.append("using namespace metal;")
         lines.append("")
-        lines.append(self._gen_kernel_signature())
+        # Function constants are declared before the kernel signature
+        fc_lines = []
+        sig = self._gen_kernel_signature(fc_lines)
+        for fc in fc_lines:
+            lines.append(fc)
+        if fc_lines:
+            lines.append("")
+        lines.append(sig)
         lines.append("{")
         lines.extend(self._gen_body())
         lines.append("}")
@@ -82,8 +94,10 @@ class MetalCodegen:
         """Check if a value is a pointer or pointer expression."""
         return value.is_pointer or value.id in self._ptr_exprs
 
-    def _gen_kernel_signature(self) -> str:
+    def _gen_kernel_signature(self, fc_lines=None) -> str:
         """Generate the kernel function signature."""
+        if fc_lines is None:
+            fc_lines = []
         params = []
         buffer_idx = 0
 
@@ -97,7 +111,7 @@ class MetalCodegen:
                 buffer_idx += 1
             else:
                 # Constexpr param — check if we can inline it
-                if param.name in self._constexpr_values:
+                if param.name in self._constexpr_values and not self._use_function_constants:
                     # Inline as literal: set var name to the literal value
                     val = self._constexpr_values[param.name]
                     if isinstance(val, float):
@@ -105,6 +119,13 @@ class MetalCodegen:
                     else:
                         self._var_names[param.id] = str(val)
                     # Don't add to signature or allocate a buffer slot
+                elif self._use_function_constants:
+                    # Use Metal [[function_constant(N)]] — compile once, specialize per value
+                    fc_idx = self._function_constant_index
+                    self._function_constant_index += 1
+                    self._function_constant_map[param.name] = fc_idx
+                    var_name = self._var(param)
+                    fc_lines.append(f"constant int {var_name} [[function_constant({fc_idx})]];")
                 else:
                     params.append(
                         f"constant int& {self._var(param)} "
@@ -140,11 +161,19 @@ class MetalCodegen:
             lines.append("")
 
         for op in self.kernel.ops:
-            # FOR_LOOP_END and IF_END decrement nesting BEFORE emitting the closing brace
-            if op.opcode in (OpCode.FOR_LOOP_END, OpCode.IF_END):
+            # Closing braces for blocks
+            if op.opcode in (OpCode.FOR_LOOP_END, OpCode.IF_END, OpCode.WHILE_END):
                 self._nesting -= 1
                 cur_indent = self.indent * (1 + self._nesting)
                 lines.append(f"{cur_indent}" + "}")
+                continue
+
+            # ELSE_START: close if-block, open else-block
+            if op.opcode == OpCode.ELSE_START:
+                self._nesting -= 1
+                cur_indent = self.indent * (1 + self._nesting)
+                lines.append(f"{cur_indent}" + "} else {")
+                self._nesting += 1
                 continue
 
             cur_indent = self.indent * (1 + self._nesting)
@@ -155,8 +184,8 @@ class MetalCodegen:
                 else:
                     lines.append(f"{cur_indent}{line}")
 
-            # FOR_LOOP_START and IF_START increment nesting AFTER emitting the opening line
-            if op.opcode in (OpCode.FOR_LOOP_START, OpCode.IF_START):
+            # Opening braces increment nesting
+            if op.opcode in (OpCode.FOR_LOOP_START, OpCode.IF_START, OpCode.WHILE_START):
                 self._nesting += 1
 
         return lines
@@ -242,6 +271,24 @@ class MetalCodegen:
 
         elif op.opcode == OpCode.IF_END:
             return None  # handled in _gen_body
+
+        elif op.opcode == OpCode.ELSE_START:
+            return None  # handled in _gen_body
+
+        elif op.opcode == OpCode.WHILE_START:
+            return "while (true) {"
+
+        elif op.opcode == OpCode.WHILE_END:
+            return None  # handled in _gen_body
+
+        elif op.opcode == OpCode.BREAK:
+            return "break;"
+
+        elif op.opcode == OpCode.CONTINUE:
+            return "continue;"
+
+        elif op.opcode in (OpCode.ATOMIC_ADD, OpCode.ATOMIC_MAX, OpCode.ATOMIC_MIN):
+            return self._gen_atomic(op)
 
         elif op.opcode == OpCode.ARANGE:
             start = op.attrs["start"]
@@ -641,9 +688,35 @@ class MetalCodegen:
         """Mapping of param IR value IDs to Metal buffer indices."""
         return self._param_buffer_map
 
+    def _gen_atomic(self, op: IROp) -> str:
+        """Generate atomic operations."""
+        result_var = self._var(op.result)
+        ptr = op.operands[0]
+        val = self._var(op.operands[1])
+        msl_type = self._msl_type(op.result.dtype)
 
-def compile_to_metal(kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None) -> tuple[str, dict[int, int]]:
+        func_map = {
+            OpCode.ATOMIC_ADD: "atomic_fetch_add_explicit",
+            OpCode.ATOMIC_MAX: "atomic_fetch_max_explicit",
+            OpCode.ATOMIC_MIN: "atomic_fetch_min_explicit",
+        }
+        func = func_map[op.opcode]
+
+        if ptr.id in self._ptr_exprs:
+            base_ptr, idx_var, _ = self._ptr_exprs[ptr.id]
+            addr = f"(device atomic_int*)({base_ptr} + {idx_var})"
+        elif ptr.is_pointer:
+            addr = f"(device atomic_int*){self._var(ptr)}"
+        else:
+            addr = f"(device atomic_int*){self._var(ptr)}"
+
+        return f"{msl_type} {result_var} = {func}({addr}, {val}, memory_order_relaxed);"
+
+
+def compile_to_metal(kernel: IRKernel, constexpr_values: dict[str, int | float] | None = None,
+                     use_function_constants: bool = False) -> tuple[str, dict[int, int]]:
     """Compile IR kernel to MSL source code. Returns (msl_source, buffer_map)."""
-    codegen = MetalCodegen(kernel, constexpr_values=constexpr_values)
+    codegen = MetalCodegen(kernel, constexpr_values=constexpr_values,
+                           use_function_constants=use_function_constants)
     source = codegen.generate()
     return source, codegen.buffer_map

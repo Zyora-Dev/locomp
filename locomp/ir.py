@@ -158,8 +158,18 @@ class OpCode(Enum):
     # Control flow
     FOR_LOOP_START = auto()   # Start of for loop: attrs={start, end, step}
     FOR_LOOP_END = auto()     # End of for loop body
+    WHILE_START = auto()      # Start of while loop
+    WHILE_END = auto()        # End of while loop body
     IF_START = auto()         # Start of if block
+    ELSE_START = auto()       # Start of else block
     IF_END = auto()           # End of if block
+    BREAK = auto()            # Break out of loop
+    CONTINUE = auto()         # Skip to next iteration
+
+    # Atomics
+    ATOMIC_ADD = auto()       # atomic_fetch_add_explicit
+    ATOMIC_MAX = auto()       # atomic_fetch_max_explicit
+    ATOMIC_MIN = auto()       # atomic_fetch_min_explicit
 
     # SIMD group operations (warp-level on Apple Silicon, 32 threads)
     SIMD_SUM = auto()         # simd_sum(x) — sum across SIMD group

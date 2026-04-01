@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from locomp.frontend import compile_kernel, constexpr, Tensor, Float16, UInt8, Int8
+from locomp.frontend import compile_kernel, constexpr, Tensor, Float16, UInt8, Int8, Int32, Bool
 from locomp.ir import IRKernel
 from locomp.optimizer import optimize
 from locomp.backends.metal_codegen import compile_to_metal
@@ -28,12 +28,14 @@ Tensor = Tensor
 Float16 = Float16
 UInt8 = UInt8
 Int8 = Int8
+Int32 = Int32
+Bool = Bool
 
 
 class LocompTensor:
     """A GPU-backed tensor. Wraps a Metal buffer + numpy array."""
 
-    _SUPPORTED_DTYPES = {np.float16, np.float32, np.float64, np.int8, np.uint8}
+    _SUPPORTED_DTYPES = {np.float16, np.float32, np.float64, np.int8, np.uint8, np.int32, np.bool_}
 
     def __init__(self, data: np.ndarray, metal_buffer=None):
         if data.dtype.type not in self._SUPPORTED_DTYPES:
@@ -44,6 +46,7 @@ class LocompTensor:
         self._shape = self.data.shape
         self._dtype = self.data.dtype
         self._gpu_dirty = False  # True when GPU has newer data than CPU
+        self._freed = False
 
     @property
     def shape(self):
@@ -92,6 +95,18 @@ class LocompTensor:
 
     def __str__(self) -> str:
         return str(self.data)
+
+    def free(self):
+        """Release GPU buffer and reclaim memory budget."""
+        if self._freed:
+            return
+        if self._metal_buffer is not None:
+            from locomp.backends.metal_runtime import get_runtime
+            runtime = get_runtime()
+            buf_size = self._metal_buffer.length()
+            runtime._allocated = max(0, runtime._allocated - buf_size)
+            self._metal_buffer = None
+        self._freed = True
 
 
 def tensor(data, dtype=np.float32) -> LocompTensor:
@@ -529,3 +544,22 @@ def simdgroup_mac(acc, a, b):
 def simdgroup_matrix(fill_value):
     """Create 8×8 matrix filled with a constant. Only valid inside @kernel."""
     raise RuntimeError("simdgroup_matrix() can only be used inside a @locomp.kernel function")
+
+
+def atomic_add(ptr, value) -> Any:
+    """Atomic add to memory. Only valid inside @kernel."""
+    raise RuntimeError("atomic_add() can only be used inside a @locomp.kernel function")
+
+def atomic_max(ptr, value) -> Any:
+    """Atomic max on memory. Only valid inside @kernel."""
+    raise RuntimeError("atomic_max() can only be used inside a @locomp.kernel function")
+
+def atomic_min(ptr, value) -> Any:
+    """Atomic min on memory. Only valid inside @kernel."""
+    raise RuntimeError("atomic_min() can only be used inside a @locomp.kernel function")
+
+
+def set_device(index: int = 0):
+    """Select which GPU device to use (for multi-GPU systems)."""
+    from locomp.backends.metal_runtime import set_device as _set_device
+    _set_device(index)
