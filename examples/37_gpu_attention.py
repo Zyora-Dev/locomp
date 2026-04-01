@@ -1,8 +1,9 @@
 """
-Example 37: GPU Causal Flash Attention — D=64 and D=128.
+Example 37: GPU Causal Flash Attention — D=64 and D=128, with GQA.
 
 Model-agnostic causal flash attention kernels using Apple simdgroup_matrix.
 Supports D=64 (GPT-2, Phi) and D=128 (Llama, Mistral, Gemma).
+Supports Grouped-Query Attention (GQA) for fewer KV heads (Llama 2/3, Mistral).
 
 Architecture:
   TG = 128 threads = 4 SIMD groups (2×2 grid)
@@ -15,8 +16,8 @@ Architecture:
   D=64:  4 acc blocks per SG half, Qs=1024,  KTs=1024,  Vs=1024
   D=128: 8 acc blocks per SG half, Qs=2048, KTs=2048, Vs=2048
 
-  Q must be pre-scaled by 1/sqrt(D) before passing to kernel.
-  Now also supports float constexpr (compiler bug fixed).
+  GQA: KV_GROUP = H_q // H_kv. Each Q head uses KV head = bh // KV_GROUP.
+       KV_GROUP=1 → standard MHA.  KV_GROUP>1 → GQA.
 """
 
 import time
@@ -34,7 +35,8 @@ Bc = 16
 @locomp.kernel
 def causal_flash_d64(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
                      O: locomp.Tensor,
-                     N: locomp.constexpr, NUM_KV_BLOCKS: locomp.constexpr):
+                     N: locomp.constexpr, NUM_KV_BLOCKS: locomp.constexpr,
+                     KV_GROUP: locomp.constexpr):
     sgid = locomp.simd_group_id()
     lane = locomp.simd_lane_id()
     bq = locomp.program_id(0)
@@ -43,6 +45,8 @@ def causal_flash_d64(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
     sg_row = sgid // 2
     sg_col = sgid % 2
     head_off = bh * N * 64
+    kv_head = bh // KV_GROUP
+    kv_off = kv_head * N * 64
 
     Qs = locomp.shared_memory(1024)
     KTs = locomp.shared_memory(1024)
@@ -74,9 +78,9 @@ def causal_flash_d64(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
             k_bc = kv_idx // 64
             k_d = kv_idx % 64
             locomp.shared_store(KTs, k_d * 16 + k_bc,
-                                locomp.load(K + (head_off + (kv_base + k_bc) * 64 + k_d)))
+                                locomp.load(K + (kv_off + (kv_base + k_bc) * 64 + k_d)))
             locomp.shared_store(Vs, kv_idx,
-                                locomp.load(V + (head_off + kv_base * 64 + kv_idx)))
+                                locomp.load(V + (kv_off + kv_base * 64 + kv_idx)))
         locomp.barrier()
 
         s_acc = locomp.simdgroup_matrix(0.0)
@@ -171,7 +175,8 @@ def causal_flash_d64(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
 @locomp.kernel
 def causal_flash_d128(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
                       O: locomp.Tensor,
-                      N: locomp.constexpr, NUM_KV_BLOCKS: locomp.constexpr):
+                      N: locomp.constexpr, NUM_KV_BLOCKS: locomp.constexpr,
+                      KV_GROUP: locomp.constexpr):
     sgid = locomp.simd_group_id()
     lane = locomp.simd_lane_id()
     bq = locomp.program_id(0)
@@ -180,6 +185,8 @@ def causal_flash_d128(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
     sg_row = sgid // 2
     sg_col = sgid % 2
     head_off = bh * N * 128
+    kv_head = bh // KV_GROUP
+    kv_off = kv_head * N * 128
 
     Qs = locomp.shared_memory(2048)    # 16*128
     KTs = locomp.shared_memory(2048)   # 128*16
@@ -219,9 +226,9 @@ def causal_flash_d128(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
             k_bc = kv_idx // 128
             k_d = kv_idx % 128
             locomp.shared_store(KTs, k_d * 16 + k_bc,
-                                locomp.load(K + (head_off + (kv_base + k_bc) * 128 + k_d)))
+                                locomp.load(K + (kv_off + (kv_base + k_bc) * 128 + k_d)))
             locomp.shared_store(Vs, kv_idx,
-                                locomp.load(V + (head_off + kv_base * 128 + kv_idx)))
+                                locomp.load(V + (kv_off + kv_base * 128 + kv_idx)))
         locomp.barrier()
 
         # QK: [16,128] × [128,16] = [16,16]
@@ -342,37 +349,54 @@ def causal_flash_d128(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
 _kernels = {64: causal_flash_d64, 128: causal_flash_d128}
 
 
-def gpu_causal_attention(Q, K, V):
-    """GPU causal flash attention. Q[H,N,D], K[H,N,D], V[H,N,D] → O[H,N,D].
-    Supports D=64 and D=128. Q is pre-scaled internally."""
-    H, N, D = Q.shape
+def gpu_causal_attention(Q, K, V, H_kv=None):
+    """GPU causal flash attention with GQA support.
+
+    Q: [H_q, N, D]   — query heads
+    K: [H_kv, N, D]   — key heads (H_kv <= H_q)
+    V: [H_kv, N, D]   — value heads
+    O: [H_q, N, D]    — output
+
+    H_kv=None → standard MHA (H_kv = H_q).
+    H_kv < H_q → GQA. H_q must be divisible by H_kv.
+    """
+    H_q, N, D = Q.shape
+    if H_kv is None:
+        H_kv = H_q
     assert D in _kernels, f"Unsupported head dim D={D}. Supported: {list(_kernels.keys())}"
     assert N % 16 == 0, f"Sequence length must be multiple of 16, got {N}"
+    assert H_q % H_kv == 0, f"H_q={H_q} must be divisible by H_kv={H_kv}"
 
+    kv_group = H_q // H_kv
     scale = 1.0 / np.sqrt(D)
     Q_scaled = (Q * scale).astype(np.float32)
 
     Q_g = locomp.tensor(Q_scaled.reshape(-1))
     K_g = locomp.tensor(K.reshape(-1))
     V_g = locomp.tensor(V.reshape(-1))
-    O_g = locomp.empty(H * N * D)
+    O_g = locomp.empty(H_q * N * D)
 
     nkv = N // 16
-    _kernels[D][(nkv, H), (32, 4)](Q_g, K_g, V_g, O_g, N, nkv)
-    return O_g.numpy().reshape(H, N, D)
+    _kernels[D][(nkv, H_q), (32, 4)](Q_g, K_g, V_g, O_g, N, nkv, kv_group)
+    return O_g.numpy().reshape(H_q, N, D)
 
 
-def numpy_causal_attention(Q, K, V):
-    H, N, D = Q.shape
+def numpy_causal_attention(Q, K, V, H_kv=None):
+    """NumPy reference with GQA support."""
+    H_q, N, D = Q.shape
+    if H_kv is None:
+        H_kv = H_q
+    kv_group = H_q // H_kv
     scale = 1.0 / np.sqrt(D)
     mask = np.triu(np.ones((N, N), dtype=np.float32), k=1) * -1e9
     out = np.zeros_like(Q)
-    for h in range(H):
-        scores = (Q[h] @ K[h].T) * scale + mask
+    for h in range(H_q):
+        kv_h = h // kv_group
+        scores = (Q[h] @ K[kv_h].T) * scale + mask
         sm = scores.max(axis=-1, keepdims=True)
         es = np.exp(scores - sm)
         aw = es / es.sum(axis=-1, keepdims=True)
-        out[h] = aw @ V[h]
+        out[h] = aw @ V[kv_h]
     return out
 
 
@@ -380,47 +404,74 @@ def numpy_causal_attention(Q, K, V):
 # Benchmark
 # =============================================================================
 
+def bench(label, Q, K, V, H_kv, warmup=5, runs=15):
+    ref = numpy_causal_attention(Q, K, V, H_kv)
+    gpu_out = gpu_causal_attention(Q, K, V, H_kv)
+    err = np.max(np.abs(gpu_out - ref))
+
+    for _ in range(warmup):
+        gpu_causal_attention(Q, K, V, H_kv)
+    times_gpu = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        gpu_causal_attention(Q, K, V, H_kv)
+        times_gpu.append((time.perf_counter() - t0) * 1000)
+    t_gpu = sorted(times_gpu)[runs // 2]
+
+    for _ in range(warmup):
+        numpy_causal_attention(Q, K, V, H_kv)
+    times_np = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        numpy_causal_attention(Q, K, V, H_kv)
+        times_np.append((time.perf_counter() - t0) * 1000)
+    t_np = sorted(times_np)[runs // 2]
+
+    r = t_gpu / t_np
+    print(f"{label:>30} | {t_gpu:>6.3f}ms | {t_np:>6.3f}ms | {r:>5.2f}x | {err:.2e}")
+
+
 if __name__ == "__main__":
-    WARMUP = 5
-    RUNS = 15
+    print(f"\n{'='*75}")
+    print("Causal Flash Attention: MHA + GQA")
+    print(f"{'='*75}")
+    print(f"{'Config':>30} | {'GPU':>8} | {'NumPy':>8} | GPU/NP | {'Error':>8}")
+    print("-" * 75)
 
-    for D in [64, 128]:
-        num_heads = 12 if D == 64 else 8
-        sizes = [16, 32, 64, 128, 256]
-
-        print(f"\n{'='*60}")
-        print(f"Causal Flash Attention D={D}, H={num_heads}")
-        print(f"{'='*60}")
-        print(f"{'N':>6} | {'GPU':>8} | {'NumPy':>8} | GPU/NP | {'Error':>8}")
-        print("-" * 52)
-
-        for N in sizes:
+    # --- MHA tests (KV_GROUP=1) ---
+    for D, H in [(64, 12), (128, 8)]:
+        for N in [64, 128, 256]:
             np.random.seed(42)
-            Q_np = np.random.randn(num_heads, N, D).astype(np.float32) * 0.1
-            K_np = np.random.randn(num_heads, N, D).astype(np.float32) * 0.1
-            V_np = np.random.randn(num_heads, N, D).astype(np.float32) * 0.1
+            Q = np.random.randn(H, N, D).astype(np.float32) * 0.1
+            K = np.random.randn(H, N, D).astype(np.float32) * 0.1
+            V = np.random.randn(H, N, D).astype(np.float32) * 0.1
+            bench(f"MHA D={D} H={H} N={N}", Q, K, V, H_kv=None)
 
-            ref = numpy_causal_attention(Q_np, K_np, V_np)
-            gpu_out = gpu_causal_attention(Q_np, K_np, V_np)
-            err = np.max(np.abs(gpu_out - ref))
+    # --- GQA tests ---
+    # Llama-style: D=128, H_q=32, H_kv=8 (group=4)
+    for N in [64, 128, 256]:
+        H_q, H_kv, D = 32, 8, 128
+        np.random.seed(42)
+        Q = np.random.randn(H_q, N, D).astype(np.float32) * 0.1
+        K = np.random.randn(H_kv, N, D).astype(np.float32) * 0.1
+        V = np.random.randn(H_kv, N, D).astype(np.float32) * 0.1
+        bench(f"GQA D={D} Hq={H_q} Hkv={H_kv} N={N}", Q, K, V, H_kv)
 
-            for _ in range(WARMUP):
-                gpu_causal_attention(Q_np, K_np, V_np)
-            times_gpu = []
-            for _ in range(RUNS):
-                t0 = time.perf_counter()
-                gpu_causal_attention(Q_np, K_np, V_np)
-                times_gpu.append((time.perf_counter() - t0) * 1000)
-            t_gpu = sorted(times_gpu)[RUNS // 2]
+    # Mistral-style: D=128, H_q=32, H_kv=8 (group=4) — same ratio
+    # Phi-style: D=64, H_q=32, H_kv=8 (group=4)
+    for N in [64, 128, 256]:
+        H_q, H_kv, D = 32, 8, 64
+        np.random.seed(42)
+        Q = np.random.randn(H_q, N, D).astype(np.float32) * 0.1
+        K = np.random.randn(H_kv, N, D).astype(np.float32) * 0.1
+        V = np.random.randn(H_kv, N, D).astype(np.float32) * 0.1
+        bench(f"GQA D={D} Hq={H_q} Hkv={H_kv} N={N}", Q, K, V, H_kv)
 
-            for _ in range(WARMUP):
-                numpy_causal_attention(Q_np, K_np, V_np)
-            times_np = []
-            for _ in range(RUNS):
-                t0 = time.perf_counter()
-                numpy_causal_attention(Q_np, K_np, V_np)
-                times_np.append((time.perf_counter() - t0) * 1000)
-            t_np = sorted(times_np)[RUNS // 2]
-
-            r_np = t_gpu / t_np
-            print(f"{N:>6} | {t_gpu:>6.3f}ms | {t_np:>6.3f}ms | {r_np:>5.2f}x | {err:.2e}")
+    # MQA test (extreme): H_q=32, H_kv=1 (group=32)
+    for N in [64, 128, 256]:
+        H_q, H_kv, D = 32, 1, 128
+        np.random.seed(42)
+        Q = np.random.randn(H_q, N, D).astype(np.float32) * 0.1
+        K = np.random.randn(H_kv, N, D).astype(np.float32) * 0.1
+        V = np.random.randn(H_kv, N, D).astype(np.float32) * 0.1
+        bench(f"MQA D={D} Hq={H_q} Hkv={H_kv} N={N}", Q, K, V, H_kv)
