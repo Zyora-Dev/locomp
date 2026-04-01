@@ -111,3 +111,52 @@ double locust_dispatch_repeat(void *queue_ptr, void *pipeline_ptr,
         return total_ms / repeat;
     }
 }
+
+// --- Batch mode ---
+// Multiple different kernels in one command buffer.
+static id<MTLCommandBuffer> _batch_cmd_buf = nil;
+
+void locust_batch_begin(void *queue_ptr) {
+    if (_batch_cmd_buf != nil) {
+        [_batch_cmd_buf waitUntilCompleted];
+        _batch_cmd_buf = nil;
+    }
+    // Also drain any pending async work
+    if (_pending_cmd_buf != nil) {
+        [_pending_cmd_buf waitUntilCompleted];
+        _pending_cmd_buf = nil;
+    }
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)queue_ptr;
+    _batch_cmd_buf = [queue commandBuffer];
+}
+
+void locust_batch_dispatch(void *pipeline_ptr,
+                           void **buffer_ptrs, int num_buffers,
+                           int gx, int gy, int gz,
+                           int tx, int ty, int tz) {
+    if (_batch_cmd_buf == nil) return;
+
+    id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)pipeline_ptr;
+
+    id<MTLComputeCommandEncoder> encoder = [_batch_cmd_buf computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+
+    for (int i = 0; i < num_buffers; i++) {
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer_ptrs[i];
+        [encoder setBuffer:buf offset:0 atIndex:i];
+    }
+
+    MTLSize grid = MTLSizeMake(gx, gy, gz);
+    MTLSize tgSize = MTLSizeMake(tx, ty, tz);
+    [encoder dispatchThreadgroups:grid threadsPerThreadgroup:tgSize];
+    [encoder endEncoding];
+}
+
+double locust_batch_end(void) {
+    if (_batch_cmd_buf == nil) return 0.0;
+    [_batch_cmd_buf commit];
+    [_batch_cmd_buf waitUntilCompleted];
+    double gpu_ms = (_batch_cmd_buf.GPUEndTime - _batch_cmd_buf.GPUStartTime) * 1000.0;
+    _batch_cmd_buf = nil;
+    return gpu_ms;
+}
