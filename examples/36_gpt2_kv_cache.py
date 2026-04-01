@@ -20,6 +20,8 @@ import locomp
 # =============================================================================
 
 BM, BN, BK = 64, 64, 8  # Tiled matmul sizes
+ATTN_BR = 16  # Flash attention block sizes
+ATTN_BC = 16
 
 
 @locomp.kernel
@@ -178,12 +180,156 @@ def copy_kernel(Src: locomp.Tensor, Dst: locomp.Tensor, N: locomp.constexpr):
     locomp.store(Dst + idx, locomp.load(Src + idx))
 
 
+@locomp.kernel
+def causal_flash_attn(Q: locomp.Tensor, K: locomp.Tensor, V: locomp.Tensor,
+                      O: locomp.Tensor,
+                      N: locomp.constexpr, D: locomp.constexpr,
+                      NUM_KV_BLOCKS: locomp.constexpr,
+                      BLOCK_R: locomp.constexpr, BLOCK_C: locomp.constexpr):
+    sgid = locomp.simd_group_id()
+    lane = locomp.simd_lane_id()
+    bq = locomp.program_id(0)
+    bh = locomp.program_id(1)
+    tid = sgid * 32 + lane
+    sg_row = sgid // 2
+    sg_col = sgid % 2
+    head_off = bh * N * D
+
+    Qs = locomp.shared_memory(1024)
+    KTs = locomp.shared_memory(1024)
+    Vs = locomp.shared_memory(1024)
+    Ss = locomp.shared_memory(256)
+    row_m = locomp.shared_memory(16)
+    row_l = locomp.shared_memory(16)
+    old_m_snap = locomp.shared_memory(16)
+    Ds = locomp.shared_memory(128)
+
+    for iq in range(8):
+        q_idx = tid + iq * 128
+        q_row = bq * 16 + q_idx // 64
+        q_col = q_idx % 64
+        locomp.shared_store(Qs, q_idx, locomp.load(Q + (head_off + q_row * 64 + q_col)))
+
+    if tid < 16:
+        locomp.shared_store(row_m, tid, -1000000.0)
+        locomp.shared_store(row_l, tid, 0.0)
+
+    acc_o0 = locomp.simdgroup_matrix(0.0)
+    acc_o1 = locomp.simdgroup_matrix(0.0)
+    acc_o2 = locomp.simdgroup_matrix(0.0)
+    acc_o3 = locomp.simdgroup_matrix(0.0)
+    locomp.barrier()
+
+    for bk in range(NUM_KV_BLOCKS):
+        kv_base = bk * 16
+        for il in range(8):
+            kv_idx = tid + il * 128
+            k_bc = kv_idx // 64
+            k_d = kv_idx % 64
+            locomp.shared_store(KTs, k_d * 16 + k_bc,
+                                locomp.load(K + (head_off + (kv_base + k_bc) * 64 + k_d)))
+            v_row = kv_idx // 64
+            v_col = kv_idx % 64
+            locomp.shared_store(Vs, v_row * 64 + v_col,
+                                locomp.load(V + (head_off + (kv_base + v_row) * 64 + v_col)))
+        locomp.barrier()
+
+        s_acc = locomp.simdgroup_matrix(0.0)
+        for dk in range(8):
+            q_blk = locomp.simdgroup_matrix_load(Qs, sg_row * 8 * 64 + dk * 8, 64)
+            kt_blk = locomp.simdgroup_matrix_load(KTs, dk * 8 * 16 + sg_col * 8, 16)
+            s_acc = locomp.simdgroup_mac(s_acc, q_blk, kt_blk)
+        locomp.simdgroup_matrix_store(s_acc, Ss, sg_row * 8 * 16 + sg_col * 8, 16)
+        locomp.barrier()
+
+        if tid < 16:
+            locomp.shared_store(old_m_snap, tid, locomp.shared_load(row_m, tid))
+        locomp.barrier()
+
+        if tid < 16:
+            row = tid
+            old_m = locomp.shared_load(old_m_snap, row)
+            q_pos = bq * 16 + row
+            block_max = -1000000.0
+            for j in range(16):
+                kv_pos = kv_base + j
+                s_val = locomp.shared_load(Ss, row * 16 + j)
+                s_val = locomp.where(kv_pos <= q_pos, s_val, -1000000.0)
+                locomp.shared_store(Ss, row * 16 + j, s_val)
+                block_max = locomp.where(s_val > block_max, s_val, block_max)
+            new_max = locomp.where(block_max > old_m, block_max, old_m)
+            locomp.shared_store(row_m, row, new_max)
+            old_sum = locomp.shared_load(row_l, row)
+            rescaled_sum = old_sum * locomp.exp(old_m - new_max)
+            block_sum = 0.0
+            for j in range(16):
+                s_val = locomp.shared_load(Ss, row * 16 + j)
+                p_val = locomp.exp(s_val - new_max)
+                block_sum = block_sum + p_val
+                locomp.shared_store(Ss, row * 16 + j, p_val)
+            locomp.shared_store(row_l, row, rescaled_sum + block_sum)
+        locomp.barrier()
+
+        locomp.shared_store(Ds, tid, 0.0)
+        locomp.barrier()
+        if tid < 8:
+            scale_top = locomp.exp(locomp.shared_load(old_m_snap, tid) - locomp.shared_load(row_m, tid))
+            locomp.shared_store(Ds, tid * 8 + tid, scale_top)
+            scale_bot = locomp.exp(locomp.shared_load(old_m_snap, tid + 8) - locomp.shared_load(row_m, tid + 8))
+            locomp.shared_store(Ds, 64 + tid * 8 + tid, scale_bot)
+        locomp.barrier()
+
+        d_mat = locomp.simdgroup_matrix_load(Ds, sg_row * 64, 8)
+        zero = locomp.simdgroup_matrix(0.0)
+        acc_o0 = locomp.simdgroup_mac(zero, d_mat, acc_o0)
+        acc_o1 = locomp.simdgroup_mac(zero, d_mat, acc_o1)
+        acc_o2 = locomp.simdgroup_mac(zero, d_mat, acc_o2)
+        acc_o3 = locomp.simdgroup_mac(zero, d_mat, acc_o3)
+
+        for jj in range(2):
+            p_blk = locomp.simdgroup_matrix_load(Ss, sg_row * 8 * 16 + jj * 8, 16)
+            v_blk0 = locomp.simdgroup_matrix_load(Vs, jj * 8 * 64 + sg_col * 32, 64)
+            v_blk1 = locomp.simdgroup_matrix_load(Vs, jj * 8 * 64 + sg_col * 32 + 8, 64)
+            v_blk2 = locomp.simdgroup_matrix_load(Vs, jj * 8 * 64 + sg_col * 32 + 16, 64)
+            v_blk3 = locomp.simdgroup_matrix_load(Vs, jj * 8 * 64 + sg_col * 32 + 24, 64)
+            acc_o0 = locomp.simdgroup_mac(acc_o0, p_blk, v_blk0)
+            acc_o1 = locomp.simdgroup_mac(acc_o1, p_blk, v_blk1)
+            acc_o2 = locomp.simdgroup_mac(acc_o2, p_blk, v_blk2)
+            acc_o3 = locomp.simdgroup_mac(acc_o3, p_blk, v_blk3)
+        locomp.barrier()
+
+    locomp.shared_store(Ds, tid, 0.0)
+    locomp.barrier()
+    if tid < 8:
+        inv_top = 1.0 / locomp.shared_load(row_l, tid)
+        locomp.shared_store(Ds, tid * 8 + tid, inv_top)
+        inv_bot = 1.0 / locomp.shared_load(row_l, tid + 8)
+        locomp.shared_store(Ds, 64 + tid * 8 + tid, inv_bot)
+    locomp.barrier()
+    d_final = locomp.simdgroup_matrix_load(Ds, sg_row * 64, 8)
+    zero2 = locomp.simdgroup_matrix(0.0)
+    acc_o0 = locomp.simdgroup_mac(zero2, d_final, acc_o0)
+    acc_o1 = locomp.simdgroup_mac(zero2, d_final, acc_o1)
+    acc_o2 = locomp.simdgroup_mac(zero2, d_final, acc_o2)
+    acc_o3 = locomp.simdgroup_mac(zero2, d_final, acc_o3)
+
+    c_row = bq * 16 + sg_row * 8
+    c_col = sg_col * 32
+    locomp.simdgroup_matrix_store_device(acc_o0, O + (head_off + c_row * 64 + c_col), 64)
+    locomp.simdgroup_matrix_store_device(acc_o1, O + (head_off + c_row * 64 + c_col + 8), 64)
+    locomp.simdgroup_matrix_store_device(acc_o2, O + (head_off + c_row * 64 + c_col + 16), 64)
+    locomp.simdgroup_matrix_store_device(acc_o3, O + (head_off + c_row * 64 + c_col + 24), 64)
+
+
 # =============================================================================
 # GPT-2 Model with KV-Cache
 # =============================================================================
 
 def pad64(n):
     return ((n + 63) // 64) * 64
+
+def pad16(n):
+    return ((n + 15) // 16) * 16
 
 def pad256(n):
     return ((n + 255) // 256) * 256
@@ -294,19 +440,30 @@ class GPT2KV:
         self.k_cache[layer][:seq_len] = k
         self.v_cache[layer][:seq_len] = v
 
-        # Multi-head attention
-        q = q.reshape(seq_len, H, HD).transpose(1, 0, 2)
-        k = k.reshape(seq_len, H, HD).transpose(1, 0, 2)
-        v = v.reshape(seq_len, H, HD).transpose(1, 0, 2)
-
+        # GPU causal flash attention
+        N_pad = pad16(seq_len)
         scale = 1.0 / np.sqrt(HD)
-        scores = np.matmul(q, k.transpose(0, 2, 1)) * scale
-        mask = np.triu(np.ones((seq_len, seq_len), dtype=np.float32), k=1) * -1e9
-        scores += mask[np.newaxis, :, :]
-        sm = scores.max(axis=-1, keepdims=True)
-        es = np.exp(scores - sm)
-        aw = es / es.sum(axis=-1, keepdims=True)
-        attn_out = np.matmul(aw, v).transpose(1, 0, 2).reshape(seq_len, D)
+
+        # Reshape to [H, N_pad, HD] and pre-scale Q
+        q_heads = np.zeros((H, N_pad, HD), dtype=np.float32)
+        k_heads = np.zeros((H, N_pad, HD), dtype=np.float32)
+        v_heads = np.zeros((H, N_pad, HD), dtype=np.float32)
+        q_heads[:, :seq_len] = q.reshape(seq_len, H, HD).transpose(1, 0, 2) * scale
+        k_heads[:, :seq_len] = k.reshape(seq_len, H, HD).transpose(1, 0, 2)
+        v_heads[:, :seq_len] = v.reshape(seq_len, H, HD).transpose(1, 0, 2)
+
+        Q_g = locomp.tensor(q_heads.reshape(-1))
+        K_g = locomp.tensor(k_heads.reshape(-1))
+        V_g = locomp.tensor(v_heads.reshape(-1))
+        O_g = locomp.empty(H * N_pad * HD)
+
+        nkv = N_pad // ATTN_BC
+        causal_flash_attn[(nkv, H), (32, 4)](
+            Q_g, K_g, V_g, O_g, N_pad, HD, nkv, ATTN_BR, ATTN_BC)
+
+        # Extract result: [H, N_pad, HD] → [seq_len, D]
+        out = O_g.numpy().reshape(H, N_pad, HD)[:, :seq_len, :]
+        attn_out = out.transpose(1, 0, 2).reshape(seq_len, D)
         return attn_out
 
     def _attention_decode(self, qkv_vec, layer, pos):
