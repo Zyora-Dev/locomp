@@ -161,6 +161,12 @@ def add_kernel(A: locomp.Tensor, B: locomp.Tensor, O: locomp.Tensor,
 
 
 @locomp.kernel
+def add_inplace_kernel(A: locomp.Tensor, B: locomp.Tensor, N: locomp.constexpr):
+    i = locomp.program_id(0)
+    locomp.store(A + i, locomp.load(A + i) + locomp.load(B + i))
+
+
+@locomp.kernel
 def copy_kernel(src: locomp.Tensor, dst: locomp.Tensor, N: locomp.constexpr):
     i = locomp.program_id(0)
     locomp.store(dst + i, locomp.load(src + i))
@@ -176,6 +182,95 @@ def embed_kernel(tokens: locomp.Tensor, table: locomp.Tensor, out: locomp.Tensor
     tok_int = tok * 1  # stays float, used as index
     val = locomp.load(table + (tok_int * DIM + d))
     locomp.store(out + (seq * DIM + d), val)
+
+
+@locomp.kernel
+def kv_cache_update_kernel(src: locomp.Tensor, dst: locomp.Tensor,
+                           POS: locomp.constexpr, MAX_SEQ: locomp.constexpr,
+                           HD: locomp.constexpr):
+    idx = locomp.program_id(0)
+    head = idx // HD
+    d = idx - head * HD
+    val = locomp.load(src + (head * HD + d))
+    locomp.store(dst + (head * MAX_SEQ * HD + POS * HD + d), val)
+
+
+@locomp.kernel
+def rms_norm_rows_kernel(X: locomp.Tensor, W: locomp.Tensor, O: locomp.Tensor,
+                         N: locomp.constexpr, EPS_X1000: locomp.constexpr):
+    row = locomp.program_id(0)
+    tid = locomp.local_id(0)
+    eps = EPS_X1000 * 0.000001
+
+    smem = locomp.shared_memory(32)
+    local_sum = 0.0
+    for i in range(tid, N, 128):
+        val = locomp.load(X + (row * N + i))
+        local_sum = local_sum + val * val
+
+    local_sum = locomp.simd_sum(local_sum)
+    sg = locomp.simd_group_id()
+    lane = locomp.simd_lane_id()
+    if lane == 0:
+        locomp.shared_store(smem, sg, local_sum)
+    locomp.barrier()
+
+    if tid == 0:
+        total = 0.0
+        for g in range(4):
+            total = total + locomp.shared_load(smem, g)
+        rms = locomp.rsqrt(total / N + eps)
+        locomp.shared_store(smem, 0, rms)
+    locomp.barrier()
+
+    rms = locomp.shared_load(smem, 0)
+    for i in range(tid, N, 128):
+        val = locomp.load(X + (row * N + i))
+        w = locomp.load(W + i)
+        locomp.store(O + (row * N + i), val * rms * w)
+
+
+@locomp.kernel
+def rope_batch_kernel(QK: locomp.Tensor, FREQ: locomp.Tensor,
+                      N_HEADS: locomp.constexpr, HD: locomp.constexpr,
+                      SEQ_LEN: locomp.constexpr, START_POS: locomp.constexpr):
+    idx = locomp.program_id(0)
+    half = HD // 2
+    total_per_pos = N_HEADS * half
+    pos_idx = idx // total_per_pos
+    rem = idx - pos_idx * total_per_pos
+    head = rem // half
+    d = rem - head * half
+
+    pos = START_POS + pos_idx
+    freq = locomp.load(FREQ + d)
+    angle = pos * freq
+    cos_a = locomp.cos(angle)
+    sin_a = locomp.sin(angle)
+
+    base = pos_idx * N_HEADS * HD
+    i0 = base + head * HD + d
+    i1 = base + head * HD + d + half
+    v0 = locomp.load(QK + i0)
+    v1 = locomp.load(QK + i1)
+    locomp.store(QK + i0, v0 * cos_a - v1 * sin_a)
+    locomp.store(QK + i1, v1 * cos_a + v0 * sin_a)
+
+
+@locomp.kernel
+def kv_cache_batch_update_kernel(src: locomp.Tensor, dst: locomp.Tensor,
+                                 START_POS: locomp.constexpr, SEQ_LEN: locomp.constexpr,
+                                 MAX_SEQ: locomp.constexpr, N_HEADS: locomp.constexpr,
+                                 HD: locomp.constexpr):
+    idx = locomp.program_id(0)
+    elems_per_pos = N_HEADS * HD
+    s = idx // elems_per_pos
+    rem = idx - s * elems_per_pos
+    head = rem // HD
+    d = rem - head * HD
+    pos = START_POS + s
+    val = locomp.load(src + (s * elems_per_pos + head * HD + d))
+    locomp.store(dst + (head * MAX_SEQ * HD + pos * HD + d), val)
 
 
 @locomp.kernel
@@ -385,12 +480,11 @@ class SmolLM2:
         self.up_buf = locomp.empty(INTER)
         self.mlp_buf = locomp.empty(INTER)
         self.down_buf = locomp.empty(HIDDEN)
-        self.residual_buf = locomp.empty(HIDDEN)
         self.scores_buf = locomp.empty(self.max_seq)
         self.logits_buf = locomp.empty(VOCAB)
 
-    def _rms_norm(self, x, w, out):
-        rms_norm_kernel[(1,), (128,)](x, w, out, HIDDEN, int(RMS_EPS * 1000000))
+    def _rms_norm(self, x, w, out, rows=1):
+        rms_norm_kernel[(rows,), (128,)](x, w, out, HIDDEN, int(RMS_EPS * 1000000))
 
     def _matvec(self, W, x, out, N, K):
         matvec_kernel[(N,), (128,)](W, x, out, N, K)
@@ -418,22 +512,13 @@ class SmolLM2:
             pos, N_HEADS, N_KV_HEADS, HEAD_DIM
         )
 
-        # Store K, V into cache at position `pos`
-        # Copy k_buf → k_cache[layer][kv_head, pos, :]
-        # We need a kernel for this — or use numpy for now
-        from locomp.backends.metal_runtime import get_runtime
-        rt = get_runtime()
-        rt.sync()
-        k_np = self.k_buf.numpy().reshape(N_KV_HEADS, HEAD_DIM)
-        v_np = self.v_buf.numpy().reshape(N_KV_HEADS, HEAD_DIM)
-
-        # Update cache numpy and re-upload (naive but correct)
-        k_cache_np = self.k_cache[layer_idx].numpy()
-        v_cache_np = self.v_cache[layer_idx].numpy()
-        k_cache_np[:, pos, :] = k_np
-        v_cache_np[:, pos, :] = v_np
-        self.k_cache[layer_idx] = locomp.tensor(k_cache_np)
-        self.v_cache[layer_idx] = locomp.tensor(v_cache_np)
+        # Store K, V into cache at position `pos` — GPU kernel, no CPU sync
+        kv_cache_update_kernel[(N_KV_HEADS * HEAD_DIM,)](
+            self.k_buf, self.k_cache[layer_idx], pos, self.max_seq, HEAD_DIM
+        )
+        kv_cache_update_kernel[(N_KV_HEADS * HEAD_DIM,)](
+            self.v_buf, self.v_cache[layer_idx], pos, self.max_seq, HEAD_DIM
+        )
 
         # GQA Attention
         seq_len = pos + 1
@@ -447,9 +532,8 @@ class SmolLM2:
         self._matvec(self.w[f"{prefix}.self_attn.o_proj.weight"], self.attn_out_buf,
                      self.o_proj_buf, HIDDEN, HIDDEN)
 
-        # Residual add: hidden = hidden + o_proj
-        add_kernel[(HIDDEN,)](self.hidden_buf, self.o_proj_buf, self.residual_buf, HIDDEN)
-        copy_kernel[(HIDDEN,)](self.residual_buf, self.hidden_buf, HIDDEN)
+        # Residual add: hidden += o_proj
+        add_inplace_kernel[(HIDDEN,)](self.hidden_buf, self.o_proj_buf, HIDDEN)
 
         # Post-attention RMSNorm
         self._rms_norm(self.hidden_buf, self.w[f"{prefix}.post_attention_layernorm.weight"],
@@ -464,9 +548,8 @@ class SmolLM2:
         self._matvec(self.w[f"{prefix}.mlp.down_proj.weight"], self.mlp_buf,
                      self.down_buf, HIDDEN, INTER)
 
-        # Residual add: hidden = hidden + down
-        add_kernel[(HIDDEN,)](self.hidden_buf, self.down_buf, self.residual_buf, HIDDEN)
-        copy_kernel[(HIDDEN,)](self.residual_buf, self.hidden_buf, HIDDEN)
+        # Residual add: hidden += down
+        add_inplace_kernel[(HIDDEN,)](self.hidden_buf, self.down_buf, HIDDEN)
 
     def forward(self, token_id, pos):
         """Forward pass for a single token at position `pos`. Returns logits numpy array."""
@@ -493,6 +576,11 @@ class SmolLM2:
 
     def generate(self, prompt, max_tokens=50, temperature=0.0):
         """Generate text from a prompt."""
+        # Reset KV cache
+        for i in range(N_LAYERS):
+            self.k_cache[i] = locomp.tensor(np.zeros((N_KV_HEADS, self.max_seq, HEAD_DIM), dtype=np.float32))
+            self.v_cache[i] = locomp.tensor(np.zeros((N_KV_HEADS, self.max_seq, HEAD_DIM), dtype=np.float32))
+
         tokens = self.tokenizer.encode(prompt)
         print(f"  Prompt tokens: {tokens[:10]}... ({len(tokens)} tokens)")
 
@@ -553,8 +641,15 @@ if __name__ == "__main__":
 
     model = SmolLM2(MODEL_PATH, TOKENIZER_PATH)
 
-    print("\n--- Generation ---")
-    prompt = "The meaning of life is"
-    print(f"Prompt: \"{prompt}\"")
-    output = model.generate(prompt, max_tokens=30, temperature=0.0)
-    print(f"\nFull output: {prompt}{output}")
+    prompts = [
+        "The meaning of life is",
+        "Once upon a time",
+        "Python is a programming language that",
+        "The capital of France is",
+    ]
+
+    for prompt in prompts:
+        print(f"\n--- Generation ---")
+        print(f"Prompt: \"{prompt}\"")
+        output = model.generate(prompt, max_tokens=30, temperature=0.0)
+        print(f"Full output: {prompt}{output}")
