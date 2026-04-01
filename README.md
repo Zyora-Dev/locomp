@@ -281,22 +281,27 @@ Loading weights... 272 tensors, 538MB
 Uploading to GPU... 538MB uploaded
 
 Prompt: "The meaning of life is"
-  Prefilling... 4.1 tok/s
   Generating:  to be found in the meaning of the universe.
-  Decode: 7.9 tok/s
 
 Prompt: "Once upon a time"
   Generating: , there was a little girl named Lily...
-  Decode: 7.6 tok/s
 
 Prompt: "Python is a programming language that"
   Generating:  allows you to write programs in a structured way...
-  Decode: 7.1 tok/s
 ```
 
 10 GPU kernels — all pure Python `@locomp.kernel`:
 
 `rms_norm` · `matvec` · `silu_mul` · `rope` · `gqa_attn` · `kv_cache_update` · `add_inplace` · `add` · `copy` · `embed`
+
+### Validated Hardware
+
+| Chip | Status | Method |
+|------|--------|--------|
+| Apple M1 | **Passed** | Local bare metal |
+| Apple M4 | **Passed** | GitHub Actions CI (macOS 15) |
+
+All 55 tests, 5 example kernels, and SmolLM2-135M inference pass on both M1 and M4.
 
 ## Benchmarks vs MLX
 
