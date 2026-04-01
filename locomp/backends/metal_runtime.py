@@ -80,6 +80,14 @@ class MetalRuntime:
         self.device_name = self.device.name()
         self.command_queue = self.device.newCommandQueue()
 
+        # Hardware capabilities
+        self.gpu_memory = self.device.recommendedMaxWorkingSetSize()  # bytes
+        self.max_buffer_size = self.device.maxBufferLength()          # bytes
+        self.max_threads_per_tg = self.device.maxThreadsPerThreadgroup()
+        # Safety: reserve 25% for OS/system, only use 75% for allocations
+        self._memory_budget = int(self.gpu_memory * 0.75)
+        self._allocated = 0
+
         # Cache compiled pipelines
         self._pipeline_cache: dict[str, any] = {}
         # Cache int buffers to avoid repeated allocation
@@ -91,6 +99,36 @@ class MetalRuntime:
             import objc
             self._objc = objc
             self._queue_ptr = objc.pyobjc_id(self.command_queue)
+
+    def _check_allocation(self, size_bytes: int):
+        """Guard against OOM — refuse allocation if it would exceed memory budget."""
+        if size_bytes > self.max_buffer_size:
+            raise MemoryError(
+                f"Buffer size {size_bytes / 1e6:.1f}MB exceeds Metal max buffer "
+                f"({self.max_buffer_size / 1e6:.1f}MB)"
+            )
+        if self._allocated + size_bytes > self._memory_budget:
+            raise MemoryError(
+                f"Allocation of {size_bytes / 1e6:.1f}MB would exceed GPU memory budget "
+                f"({self._memory_budget / 1e6:.1f}MB used: {self._allocated / 1e6:.1f}MB). "
+                f"Total GPU memory: {self.gpu_memory / 1e6:.1f}MB. "
+                f"Use smaller sizes or free tensors."
+            )
+
+    def hardware_info(self) -> dict:
+        """Return GPU hardware capabilities."""
+        return {
+            "device": self.device_name,
+            "gpu_memory_mb": round(self.gpu_memory / 1e6),
+            "max_buffer_mb": round(self.max_buffer_size / 1e6),
+            "memory_budget_mb": round(self._memory_budget / 1e6),
+            "allocated_mb": round(self._allocated / 1e6, 1),
+            "max_threads_per_threadgroup": (
+                self.max_threads_per_tg.width,
+                self.max_threads_per_tg.height,
+                self.max_threads_per_tg.depth,
+            ),
+        }
 
     def compile_msl(self, source: str, kernel_name: str):
         """Compile MSL source code into a compute pipeline state."""
@@ -127,22 +165,26 @@ class MetalRuntime:
         """Allocate a Metal buffer and upload numpy data."""
         Metal = self._Metal
         byte_data = data.tobytes()
+        self._check_allocation(len(byte_data))
         buffer = self.device.newBufferWithBytes_length_options_(
             byte_data, len(byte_data),
             Metal.MTLResourceStorageModeShared
         )
         if buffer is None:
             raise RuntimeError(f"Failed to allocate Metal buffer of {len(byte_data)} bytes")
+        self._allocated += len(byte_data)
         return buffer
 
     def allocate_empty_buffer(self, size_bytes: int) -> any:
         """Allocate an empty Metal buffer."""
         Metal = self._Metal
+        self._check_allocation(size_bytes)
         buffer = self.device.newBufferWithLength_options_(
             size_bytes, Metal.MTLResourceStorageModeShared
         )
         if buffer is None:
             raise RuntimeError(f"Failed to allocate Metal buffer of {size_bytes} bytes")
+        self._allocated += size_bytes
         return buffer
 
     def allocate_int_buffer(self, value: int) -> any:

@@ -305,6 +305,12 @@ def kernel(func: Callable = None, *, backend: str = "auto") -> KernelLauncher:
     return wrapper
 
 
+def hardware_info() -> dict:
+    """Return GPU hardware capabilities (memory, max buffer, thread limits)."""
+    from locomp.backends.metal_runtime import get_runtime
+    return get_runtime().hardware_info()
+
+
 # --- Kernel primitive functions (used inside @kernel functions) ---
 # These are never actually called at runtime — the AST compiler intercepts them.
 # They exist for IDE autocomplete and type checking.
