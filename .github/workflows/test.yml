@@ -67,11 +67,11 @@ jobs:
           echo "=== Softmax ==="
           python examples/05_softmax.py
           echo ""
-          echo "=== RMSNorm ==="
-          python examples/29_rms_norm.py
+          echo "=== Float16 ==="
+          python examples/06_float16_vector_add.py
           echo ""
-          echo "=== Flash Attention ==="
-          python examples/15_flash_attention.py
+          echo "=== Math Ops ==="
+          python examples/23_math_ops.py
 
       - name: Run SmolLM2 inference
         run: |
