@@ -689,7 +689,12 @@ class MetalCodegen:
         elif is_alias:
             return f"{result_var} = {lhs_var} {op_sym} {rhs_var};"
         else:
-            return f"{msl_type} {result_var} = {lhs_var} {op_sym} {rhs_var};"
+            msl_expr = f"{lhs_var} {op_sym} {rhs_var}"
+            # Bfloat arithmetic in MSL: mixed float/bfloat produces float;
+            # cast result explicitly back to bfloat to avoid type mismatch.
+            if op.result.dtype == IRType.BFLOAT16:
+                msl_expr = f"({msl_type})({msl_expr})"
+            return f"{msl_type} {result_var} = {msl_expr};"
 
     def _gen_load(self, op: IROp) -> str | list[str]:
         """Generate load — resolves ptr expressions to base[index] access."""
