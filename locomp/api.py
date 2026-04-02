@@ -769,6 +769,25 @@ def atomic_min(ptr, value) -> Any:
     raise RuntimeError("atomic_min() can only be used inside a @locomp.kernel function")
 
 
+def reduce_sum(val, acc_ptr) -> Any:
+    """Global sum reduction: SIMD partial sum + atomic_add to acc_ptr[0].
+    Each thread contributes val; SIMD group reduces, then one thread does atomic add.
+    Initialize acc_ptr to zero before dispatch. Only valid inside @kernel."""
+    raise RuntimeError("reduce_sum() can only be used inside a @locomp.kernel function")
+
+def reduce_max(val, acc_ptr) -> Any:
+    """Global max reduction: SIMD max + CAS atomic max to acc_ptr[0].
+    Works correctly for non-negative floats and integers.
+    Initialize acc_ptr to -inf (or 0 for non-negative) before dispatch. Only valid inside @kernel."""
+    raise RuntimeError("reduce_max() can only be used inside a @locomp.kernel function")
+
+def reduce_min(val, acc_ptr) -> Any:
+    """Global min reduction: SIMD min + CAS atomic min to acc_ptr[0].
+    Works correctly for non-negative floats and integers.
+    Initialize acc_ptr to +inf (or large value) before dispatch. Only valid inside @kernel."""
+    raise RuntimeError("reduce_min() can only be used inside a @locomp.kernel function")
+
+
 def set_device(index: int = 0):
     """Select which GPU device to use (for multi-GPU systems)."""
     from locomp.backends.metal_runtime import set_device as _set_device

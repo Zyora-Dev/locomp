@@ -102,6 +102,8 @@ _FUNC_MAP = {
     "floor": OpCode.FLOOR,
     "round": OpCode.ROUND,
     "sigmoid": OpCode.SIGMOID,
+    "max": OpCode.REDUCE_MAX,
+    "min": OpCode.REDUCE_MIN,
 }
 
 
@@ -756,6 +758,7 @@ class KernelCompiler(ast.NodeVisitor):
             return result
 
         # Math functions: locomp.sqrt, locomp.exp, locomp.log, etc. (1-arg)
+        # Also: locomp.max(tile), locomp.min(tile) — tile reductions
         if func_name in _FUNC_MAP:
             opcode = _FUNC_MAP[func_name]
             arg = self._visit_expr(node.args[0])
@@ -765,6 +768,21 @@ class KernelCompiler(ast.NodeVisitor):
             else:
                 result = self.kernel.new_value("math", arg.dtype, shape=arg.shape)
             self.kernel.add_op(opcode, result, [arg])
+            return result
+
+        # locomp.reduce_sum(val, acc_ptr) — global reduction: SIMD partial + atomic_add
+        # locomp.reduce_max(val, acc_ptr) — global reduction: SIMD max + CAS atomic max
+        # locomp.reduce_min(val, acc_ptr) — global reduction: SIMD min + CAS atomic min
+        if func_name in ("reduce_sum", "reduce_max", "reduce_min"):
+            val = self._visit_expr(node.args[0])
+            ptr = self._visit_expr(node.args[1])
+            opcode_map = {
+                "reduce_sum": OpCode.REDUCE_SUM,
+                "reduce_max": OpCode.REDUCE_MAX,
+                "reduce_min": OpCode.REDUCE_MIN,
+            }
+            result = self.kernel.new_value(func_name[:2], val.dtype)
+            self.kernel.add_op(opcode_map[func_name], result, [val, ptr])
             return result
 
         # locomp.atomic_add(ptr, val) — returns old value

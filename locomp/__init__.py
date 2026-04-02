@@ -32,6 +32,9 @@ from locomp.api import (
     atomic_add,
     atomic_max,
     atomic_min,
+    reduce_sum,
+    reduce_max,
+    reduce_min,
     arange,
     load,
     store,
@@ -79,7 +82,7 @@ from locomp.api import (
     Bool,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "Config",
     "autotune",
@@ -149,6 +152,9 @@ __all__ = [
     "atomic_add",
     "atomic_max",
     "atomic_min",
+    "reduce_sum",
+    "reduce_max",
+    "reduce_min",
     "hardware_info",
     "set_device",
     "constexpr",
