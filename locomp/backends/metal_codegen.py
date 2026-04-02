@@ -572,6 +572,22 @@ class MetalCodegen:
         elif op.opcode == OpCode.REDUCE_SUM:
             arg = self._var(op.operands[0])
             msl_type = self._msl_type(op.result.dtype)
+            if len(op.operands) == 2:
+                # Global reduction: SIMD partial sum → atomic add to accumulator pointer
+                ptr = op.operands[1]
+                if ptr.id in self._ptr_exprs:
+                    base_ptr, idx_expr, _ = self._ptr_exprs[ptr.id]
+                    addr = f"({base_ptr} + {idx_expr})"
+                else:
+                    addr = self._var(ptr)
+                p = result_var
+                return [
+                    f"{msl_type} _{p}_partial = simd_sum({arg});",
+                    f"if (simd_lid == 0) {{",
+                    f"    atomic_fetch_add_explicit((device atomic<float>*){addr}, (float)_{p}_partial, memory_order_relaxed);",
+                    f"}}",
+                    f"{msl_type} {result_var} = _{p}_partial;",
+                ]
             if op.operands[0].shape:
                 size = op.operands[0].shape[0]
                 return [
@@ -585,6 +601,33 @@ class MetalCodegen:
         elif op.opcode == OpCode.REDUCE_MAX:
             arg = self._var(op.operands[0])
             msl_type = self._msl_type(op.result.dtype)
+            if len(op.operands) == 2:
+                # Global reduction: SIMD max → CAS atomic max to accumulator pointer
+                ptr = op.operands[1]
+                if ptr.id in self._ptr_exprs:
+                    base_ptr, idx_expr, _ = self._ptr_exprs[ptr.id]
+                    addr = f"({base_ptr} + {idx_expr})"
+                else:
+                    addr = self._var(ptr)
+                p = result_var
+                if op.result.dtype.is_float:
+                    return [
+                        f"{msl_type} _{p}_partial = simd_max({arg});",
+                        f"if (simd_lid == 0) {{",
+                        f"    device atomic<uint>* _{p}_aptr = (device atomic<uint>*){addr};",
+                        f"    uint _{p}_old = atomic_load_explicit(_{p}_aptr, memory_order_relaxed);",
+                        f"    while (as_type<float>(_{p}_old) < _{p}_partial && !atomic_compare_exchange_weak_explicit(_{p}_aptr, &_{p}_old, as_type<uint>(_{p}_partial), memory_order_relaxed, memory_order_relaxed));",
+                        f"}}",
+                        f"{msl_type} {result_var} = _{p}_partial;",
+                    ]
+                else:
+                    return [
+                        f"{msl_type} _{p}_partial = simd_max({arg});",
+                        f"if (simd_lid == 0) {{",
+                        f"    atomic_fetch_max_explicit((device atomic_int*){addr}, (int)_{p}_partial, memory_order_relaxed);",
+                        f"}}",
+                        f"{msl_type} {result_var} = _{p}_partial;",
+                    ]
             if op.operands[0].shape:
                 size = op.operands[0].shape[0]
                 return [
@@ -598,6 +641,33 @@ class MetalCodegen:
         elif op.opcode == OpCode.REDUCE_MIN:
             arg = self._var(op.operands[0])
             msl_type = self._msl_type(op.result.dtype)
+            if len(op.operands) == 2:
+                # Global reduction: SIMD min → CAS atomic min to accumulator pointer
+                ptr = op.operands[1]
+                if ptr.id in self._ptr_exprs:
+                    base_ptr, idx_expr, _ = self._ptr_exprs[ptr.id]
+                    addr = f"({base_ptr} + {idx_expr})"
+                else:
+                    addr = self._var(ptr)
+                p = result_var
+                if op.result.dtype.is_float:
+                    return [
+                        f"{msl_type} _{p}_partial = simd_min({arg});",
+                        f"if (simd_lid == 0) {{",
+                        f"    device atomic<uint>* _{p}_aptr = (device atomic<uint>*){addr};",
+                        f"    uint _{p}_old = atomic_load_explicit(_{p}_aptr, memory_order_relaxed);",
+                        f"    while (as_type<float>(_{p}_old) > _{p}_partial && !atomic_compare_exchange_weak_explicit(_{p}_aptr, &_{p}_old, as_type<uint>(_{p}_partial), memory_order_relaxed, memory_order_relaxed));",
+                        f"}}",
+                        f"{msl_type} {result_var} = _{p}_partial;",
+                    ]
+                else:
+                    return [
+                        f"{msl_type} _{p}_partial = simd_min({arg});",
+                        f"if (simd_lid == 0) {{",
+                        f"    atomic_fetch_min_explicit((device atomic_int*){addr}, (int)_{p}_partial, memory_order_relaxed);",
+                        f"}}",
+                        f"{msl_type} {result_var} = _{p}_partial;",
+                    ]
             if op.operands[0].shape:
                 size = op.operands[0].shape[0]
                 return [
@@ -658,17 +728,22 @@ class MetalCodegen:
             else:
                 ptr_op, idx_op = rhs, lhs
 
-            # Resolve base pointer
-            if ptr_op.id in self._ptr_exprs:
-                base_ptr = self._ptr_exprs[ptr_op.id][0]
-            else:
-                base_ptr = self._var(ptr_op)
-
             idx_var = self._var(idx_op)
             is_tiled = bool(idx_op.shape)
             # Cast float indices to int for valid MSL array subscript
             if idx_op.dtype.is_float and not is_tiled:
                 idx_var = f"(int){idx_var}"
+
+            # Resolve base pointer, combining indices for chained ptr arithmetic
+            # e.g. (A + row*N) + col  →  A_ptr with index (row*N + col)
+            if ptr_op.id in self._ptr_exprs:
+                base_ptr, prev_idx, prev_tiled = self._ptr_exprs[ptr_op.id]
+                if prev_idx is not None:
+                    idx_var = f"({prev_idx} + {idx_var})"
+                is_tiled = is_tiled or prev_tiled
+            else:
+                base_ptr = self._var(ptr_op)
+
             self._ptr_exprs[op.result.id] = (base_ptr, idx_var, is_tiled)
             return None  # No MSL emitted — LOAD/STORE will use the ptr expression
 
@@ -690,9 +765,9 @@ class MetalCodegen:
             return f"{result_var} = {lhs_var} {op_sym} {rhs_var};"
         else:
             msl_expr = f"{lhs_var} {op_sym} {rhs_var}"
-            # Bfloat arithmetic in MSL: mixed float/bfloat produces float;
-            # cast result explicitly back to bfloat to avoid type mismatch.
-            if op.result.dtype == IRType.BFLOAT16:
+            # In MSL, arithmetic on half/bfloat promotes to float;
+            # cast result explicitly back to avoid type mismatch on assignment.
+            if op.result.dtype in (IRType.BFLOAT16, IRType.FLOAT16):
                 msl_expr = f"({msl_type})({msl_expr})"
             return f"{msl_type} {result_var} = {msl_expr};"
 

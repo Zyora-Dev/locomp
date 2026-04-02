@@ -205,6 +205,8 @@ def dead_code_eliminate(kernel: IRKernel) -> IRKernel:
         OpCode.BREAK, OpCode.CONTINUE,
         OpCode.SIMDGROUP_MATRIX_STORE,
         OpCode.ATOMIC_ADD, OpCode.ATOMIC_MAX, OpCode.ATOMIC_MIN,
+        # reduce_*(val, acc_ptr) atomically writes to acc_ptr — always live
+        OpCode.REDUCE_SUM, OpCode.REDUCE_MAX, OpCode.REDUCE_MIN,
     }
 
     for op in kernel.ops:
