@@ -356,6 +356,10 @@ class KernelCompiler(ast.NodeVisitor):
         self.kernel.add_op(OpCode.CONTINUE, marker)
 
     def _visit_expr_stmt(self, node: ast.Expr):
+        # Skip standalone string constants (docstrings, bare string no-ops) —
+        # they have no effect in compiled GPU kernels.
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return
         self._visit_expr(node.value)
 
     def _visit_expr(self, node: ast.expr) -> IRValue:
@@ -410,7 +414,14 @@ class KernelCompiler(ast.NodeVisitor):
         if opcode is None:
             raise NotImplementedError(f"Binary op not supported: {type(node.op).__name__}")
         out_shape = lhs.shape if lhs.shape else rhs.shape
-        out_dtype = IRType.FLOAT32 if lhs.dtype.is_float or rhs.dtype.is_float else IRType.INT32
+        # Preserve bfloat16/float16 dtype when both operands share the same float type.
+        # Only upcast to float32 when mixing types (e.g. float32 + int32).
+        if lhs.dtype == rhs.dtype and lhs.dtype.is_float:
+            out_dtype = lhs.dtype
+        elif lhs.dtype.is_float or rhs.dtype.is_float:
+            out_dtype = IRType.FLOAT32
+        else:
+            out_dtype = IRType.INT32
         result = self.kernel.new_value("tmp", out_dtype, shape=out_shape)
         self.kernel.add_op(opcode, result, [lhs, rhs])
         return result
