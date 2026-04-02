@@ -315,8 +315,8 @@ if __name__ == "__main__":
         x = np.random.randn(K).astype(np.float32) * 0.1
         w_packed, scales = quantize_int4(w_float, GROUP_SIZE)
 
-        # Correctness: element-wise reference
-        ref = numpy_matvec_int4(x, w_packed, scales, GROUP_SIZE)
+        # Correctness: use fast vectorized numpy (not slow Python loop)
+        ref = fast_numpy_matvec_int4(x, w_packed, scales, GROUP_SIZE)
         gpu_out = gpu_matvec_int4(x, w_packed, scales, GROUP_SIZE)
         err = np.max(np.abs(gpu_out - ref))
 
@@ -349,7 +349,7 @@ if __name__ == "__main__":
         x = np.random.randn(K).astype(np.float32) * 0.1
         w_int8, scales = quantize_int8(w_float, GROUP_SIZE)
 
-        ref = numpy_matvec_int8(x, w_int8, scales, GROUP_SIZE)
+        ref = fast_numpy_matvec_int8(x, w_int8, scales, GROUP_SIZE)
         gpu_out = gpu_matvec_int8(x, w_int8, scales, GROUP_SIZE)
         err = np.max(np.abs(gpu_out - ref))
 
