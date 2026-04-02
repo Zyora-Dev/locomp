@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from locomp.frontend import compile_kernel, constexpr, Tensor, Float16, UInt8, Int8, Int32, Bool
+from locomp.frontend import compile_kernel, constexpr, Tensor, Float16, BFloat16, UInt8, Int8, Int32, Bool
 from locomp.ir import IRKernel
 from locomp.optimizer import optimize
 from locomp.backends.metal_codegen import compile_to_metal
@@ -26,6 +26,7 @@ from locomp.backends.metal_codegen import compile_to_metal
 constexpr = constexpr
 Tensor = Tensor
 Float16 = Float16
+BFloat16 = BFloat16
 UInt8 = UInt8
 Int8 = Int8
 Int32 = Int32
