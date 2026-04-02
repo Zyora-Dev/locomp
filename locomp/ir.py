@@ -22,6 +22,7 @@ from typing import Optional
 class IRType(Enum):
     """Data types supported in the IR."""
     FLOAT16 = auto()
+    BFLOAT16 = auto()
     FLOAT32 = auto()
     FLOAT64 = auto()
     INT8 = auto()
@@ -37,7 +38,7 @@ class IRType(Enum):
     @property
     def bytewidth(self) -> int:
         _widths = {
-            IRType.FLOAT16: 2, IRType.FLOAT32: 4, IRType.FLOAT64: 8,
+            IRType.FLOAT16: 2, IRType.BFLOAT16: 2, IRType.FLOAT32: 4, IRType.FLOAT64: 8,
             IRType.INT8: 1, IRType.INT16: 2, IRType.INT32: 4, IRType.INT64: 8,
             IRType.UINT8: 1, IRType.UINT16: 2, IRType.UINT32: 4, IRType.UINT64: 8,
             IRType.BOOL: 1,
@@ -46,7 +47,7 @@ class IRType(Enum):
 
     @property
     def is_float(self) -> bool:
-        return self in (IRType.FLOAT16, IRType.FLOAT32, IRType.FLOAT64)
+        return self in (IRType.FLOAT16, IRType.BFLOAT16, IRType.FLOAT32, IRType.FLOAT64)
 
     @property
     def is_int(self) -> bool:
@@ -55,7 +56,7 @@ class IRType(Enum):
     def to_msl(self) -> str:
         """Convert to Metal Shading Language type string."""
         _msl = {
-            IRType.FLOAT16: "half", IRType.FLOAT32: "float", IRType.FLOAT64: "float",
+            IRType.FLOAT16: "half", IRType.BFLOAT16: "bfloat", IRType.FLOAT32: "float", IRType.FLOAT64: "float",
             IRType.INT8: "char", IRType.INT16: "short", IRType.INT32: "int", IRType.INT64: "long",
             IRType.UINT8: "uchar", IRType.UINT16: "ushort", IRType.UINT32: "uint",
             IRType.UINT64: "ulong", IRType.BOOL: "bool",

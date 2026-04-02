@@ -4,6 +4,7 @@ Write GPU kernels in Python, compile to native Metal shaders.
 """
 
 from locomp.autotune import Config, autotune, clear_cache
+from locomp.frontend import LocompKernelError
 from locomp.api import (
     kernel,
     program_id,
@@ -71,6 +72,7 @@ from locomp.api import (
     constexpr,
     Tensor,
     Float16,
+    BFloat16,
     UInt8,
     Int8,
     Int32,
@@ -82,6 +84,7 @@ __all__ = [
     "Config",
     "autotune",
     "clear_cache",
+    "LocompKernelError",
     "kernel",
     "program_id",
     "thread_id",
@@ -151,6 +154,7 @@ __all__ = [
     "constexpr",
     "Tensor",
     "Float16",
+    "BFloat16",
     "UInt8",
     "Int8",
     "Int32",

@@ -50,6 +50,11 @@ class Bool:
     pass
 
 
+class BFloat16:
+    """Type annotation for bfloat16 tensor/pointer kernel parameters."""
+    pass
+
+
 # --- AST → IR Compiler ---
 
 _BINOP_MAP = {
@@ -141,6 +146,11 @@ class KernelCompiler(ast.NodeVisitor):
                 self._var_depth[name] = 0
             elif ann is Bool or (isinstance(ann, type) and issubclass(ann, Bool)):
                 val = self.kernel.new_value(name, IRType.BOOL, is_pointer=True)
+                self.kernel.params.append(val)
+                self.scope[name] = val
+                self._var_depth[name] = 0
+            elif ann is BFloat16 or (isinstance(ann, type) and issubclass(ann, BFloat16)):
+                val = self.kernel.new_value(name, IRType.BFLOAT16, is_pointer=True)
                 self.kernel.params.append(val)
                 self.scope[name] = val
                 self._var_depth[name] = 0
@@ -645,6 +655,7 @@ class KernelCompiler(ast.NodeVisitor):
             dtype_node = node.args[1]
             _cast_dtype_map = {
                 "float32": IRType.FLOAT32, "float16": IRType.FLOAT16,
+                "bfloat16": IRType.BFLOAT16,
                 "int32": IRType.INT32, "int8": IRType.INT8,
                 "uint8": IRType.UINT8, "uint32": IRType.UINT32,
             }
@@ -830,6 +841,11 @@ class KernelCompiler(ast.NodeVisitor):
         return IRType.FLOAT32
 
 
+class LocompKernelError(Exception):
+    """Raised when a @locomp.kernel function fails to compile."""
+    pass
+
+
 def compile_kernel(func: Callable) -> IRKernel:
     """Compile a Python function into Locust IR."""
     source = inspect.getsource(func)
@@ -858,4 +874,24 @@ def compile_kernel(func: Callable) -> IRKernel:
             except ValueError:
                 pass
     compiler._func_globals = func_globals
-    return compiler.compile(func_def)
+
+    source_lines = source.splitlines()
+
+    try:
+        return compiler.compile(func_def)
+    except (NotImplementedError, ValueError, TypeError, NameError, AssertionError) as exc:
+        # Attach source context to the error
+        lineno = getattr(exc, '__lineno__', None)
+        context = ""
+        if lineno and 1 <= lineno <= len(source_lines):
+            snippet = source_lines[lineno - 1].strip()
+            context = f"\n  Line {lineno}: {snippet}"
+        raise LocompKernelError(
+            f"\n\nError compiling @locomp.kernel '{func.__name__}':{context}\n"
+            f"  {type(exc).__name__}: {exc}\n\n"
+            f"Check:\n"
+            f"  - All variables are defined before use\n"
+            f"  - Only supported locomp built-ins are called\n"
+            f"  - Parameter types are locomp.Tensor, locomp.constexpr, or a dtype (locomp.Float16, locomp.BFloat16, etc.)\n"
+            f"  - No unsupported Python operations (walrus :=, starred *, match/case)\n"
+        ) from exc

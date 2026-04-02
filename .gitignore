@@ -33,3 +33,7 @@ progress.md
 roadmap.md
 debug_ir.py
 _test_tensor_ops.py
+.env
+
+# Website (not part of the compiler library)
+website/
