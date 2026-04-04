@@ -22,7 +22,7 @@ image = (
     .apt_install("git")
     .pip_install("numpy")
     .run_commands(
-        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@c917d8f'",
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@7348441'",
     )
 )
 
