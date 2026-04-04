@@ -174,8 +174,15 @@ class CUDACodegen:
             "#include <math.h>",
             "#include <cuda_fp16.h>",
             "#include <cuda_bf16.h>",
-            "",
         ]
+
+        # Include wmma headers if this kernel uses tensor core ops
+        if self._uses_wmma():
+            lines += [
+                "#include <mma.h>",
+                "using namespace nvcuda;",
+            ]
+        lines.append("")
 
         # The __global__ kernel
         lines += self._gen_kernel_fn()
@@ -635,13 +642,97 @@ class CUDACodegen:
         elif op.opcode == OpCode.CONTINUE:
             return "continue;"
 
-        # ── simdgroup matrix — map to wmma or scalar fallback ─────────────────
-        elif op.opcode in (OpCode.SIMDGROUP_MATRIX_LOAD, OpCode.SIMDGROUP_MATRIX_STORE,
-                           OpCode.SIMDGROUP_MATRIX_MAC, OpCode.SIMDGROUP_MATRIX_FILL):
-            return f"/* simdgroup matrix op — use wmma directly in CUDA */"
+        # ── simdgroup matrix → CUDA wmma tensor core ops ─────────────────────
+        elif op.opcode == OpCode.SIMDGROUP_MATRIX_FILL:
+            rv = self._vname(op.result)
+            fill = self._vname(op.operands[0])
+            frag_type = self._wmma_fragment_type(op.result.dtype, role="acc")
+            lines = [f"wmma::fragment<{frag_type}> {rv};"]
+            lines.append(f"wmma::fill_fragment({rv}, ({_c_type(op.result.dtype)}){fill});")
+            return lines
+
+        elif op.opcode == OpCode.SIMDGROUP_MATRIX_LOAD:
+            rv = self._vname(op.result)
+            source = op.attrs.get("source", "shared")
+            role   = op.attrs.get("role", "a")   # "a", "b", or "acc"
+            layout = "wmma::row_major" if op.attrs.get("row_major", True) else "wmma::col_major"
+            frag_type = self._wmma_fragment_type(op.result.dtype, role=role, layout=layout)
+            if source == "shared":
+                arr    = self._vname(op.operands[0])
+                offset = self._vname(op.operands[1])
+                stride = self._vname(op.operands[2])
+                lines = [f"wmma::fragment<{frag_type}> {rv};"]
+                lines.append(f"wmma::load_matrix_sync({rv}, {arr} + {offset}, {stride});")
+            else:  # device pointer
+                ptr    = self._vname(op.operands[0])
+                if op.operands[0].id in self._ptr_exprs:
+                    pb, pi, _ = self._ptr_exprs[op.operands[0].id]
+                    ptr = f"({pb} + {pi})"
+                stride = self._vname(op.operands[1])
+                lines = [f"wmma::fragment<{frag_type}> {rv};"]
+                lines.append(f"wmma::load_matrix_sync({rv}, {ptr}, {stride});")
+            return lines
+
+        elif op.opcode == OpCode.SIMDGROUP_MATRIX_STORE:
+            dest   = op.attrs.get("dest", "shared")
+            mat    = self._vname(op.operands[0])
+            layout = "wmma::mem_row_major" if op.attrs.get("row_major", True) else "wmma::mem_col_major"
+            if dest == "shared":
+                arr    = self._vname(op.operands[1])
+                offset = self._vname(op.operands[2])
+                stride = self._vname(op.operands[3])
+                return f"wmma::store_matrix_sync({arr} + {offset}, {mat}, {stride}, {layout});"
+            else:  # device pointer
+                ptr    = self._vname(op.operands[1])
+                if op.operands[1].id in self._ptr_exprs:
+                    pb, pi, _ = self._ptr_exprs[op.operands[1].id]
+                    ptr = f"({pb} + {pi})"
+                stride = self._vname(op.operands[2])
+                return f"wmma::store_matrix_sync({ptr}, {mat}, {stride}, {layout});"
+
+        elif op.opcode == OpCode.SIMDGROUP_MATRIX_MAC:
+            rv  = self._vname(op.result)
+            acc = self._vname(op.operands[0])
+            a   = self._vname(op.operands[1])
+            b   = self._vname(op.operands[2])
+            # wmma::mma_sync(d, a, b, c)  — d = a*b + c
+            if op.result.aliases is not None:
+                return f"wmma::mma_sync({rv}, {a}, {b}, {acc});"
+            # new accumulator fragment — copy c into d first then accumulate
+            frag_type = self._wmma_fragment_type(op.result.dtype, role="acc")
+            return [
+                f"wmma::fragment<{frag_type}> {rv};",
+                f"wmma::mma_sync({rv}, {a}, {b}, {acc});",
+            ]
 
         else:
             return f"/* unhandled op: {op.opcode.name} */"
+
+    # ── wmma / tensor core helpers ───────────────────────────────────────────
+
+    def _uses_wmma(self) -> bool:
+        """Return True if any op in this kernel uses simdgroup/wmma matrix ops."""
+        wmma_ops = {OpCode.SIMDGROUP_MATRIX_LOAD, OpCode.SIMDGROUP_MATRIX_STORE,
+                    OpCode.SIMDGROUP_MATRIX_MAC, OpCode.SIMDGROUP_MATRIX_FILL}
+        return any(op.opcode in wmma_ops for op in self.kernel.ops)
+
+    def _wmma_fragment_type(self, dtype: IRType, role: str = "a",
+                             layout: str = "wmma::row_major") -> str:
+        """Return the wmma::fragment<...> template arguments string.
+
+        CUDA wmma uses 16x16x16 tiles for fp16, 16x16x8 for tf32.
+        We always use the 16x16x16 fp16 variant since locomp maps
+        Metal's 8x8 simdgroup ops to the smallest CUDA tensor core tile.
+
+        role: "a" | "b" | "acc"
+        """
+        if role == "acc":
+            # Accumulator is always float32
+            return "wmma::accumulator, 16, 16, 16, float"
+        ct = "__half" if dtype == IRType.FLOAT16 else "__half"  # always fp16 input tiles
+        if role == "b":
+            return f"wmma::matrix_b, 16, 16, 16, {ct}, {layout}"
+        return f"wmma::matrix_a, 16, 16, 16, {ct}, {layout}"
 
     # ── load / store helpers ─────────────────────────────────────────────────
 

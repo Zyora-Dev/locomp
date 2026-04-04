@@ -179,3 +179,54 @@ def test_cuda_param_map_excludes_constexpr():
     assert "A" in param_map
     assert "B" in param_map
     assert "Out" in param_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# wmma / tensor core tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cuda_wmma_fill_fragment():
+    def k(Out: locomp.Tensor, N: locomp.constexpr):
+        i = locomp.program_id(0)
+        acc = locomp.simdgroup_matrix(0.0)
+        locomp.simdgroup_matrix_store_device(acc, Out + i, 16)
+
+    src, _ = _codegen(k, {"N": 16})
+    assert "wmma::fill_fragment" in src
+    assert "wmma::accumulator" in src
+
+
+def test_cuda_wmma_mma_sync():
+    def k(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
+          N: locomp.constexpr):
+        i = locomp.program_id(0)
+        a = locomp.simdgroup_matrix_load_device(A + i, 16)
+        b = locomp.simdgroup_matrix_load_device(B + i, 16)
+        acc = locomp.simdgroup_matrix(0.0)
+        result = locomp.simdgroup_mac(acc, a, b)
+        locomp.simdgroup_matrix_store_device(result, Out + i, 16)
+
+    src, _ = _codegen(k, {"N": 16})
+    assert "wmma::mma_sync" in src
+    assert "wmma::load_matrix_sync" in src
+    assert "wmma::store_matrix_sync" in src
+
+
+def test_cuda_wmma_includes_mma_header():
+    def k(A: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+        i = locomp.program_id(0)
+        acc = locomp.simdgroup_matrix(0.0)
+        locomp.simdgroup_matrix_store_device(acc, Out + i, 16)
+
+    src, _ = _codegen(k, {"N": 16})
+    assert "#include <mma.h>" in src
+    assert "using namespace nvcuda" in src
+
+
+def test_cuda_no_wmma_header_without_matrix_ops():
+    def k(A: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+        i = locomp.program_id(0)
+        locomp.store(Out + i, locomp.load(A + i) * 2.0)
+
+    src, _ = _codegen(k, {"N": 16})
+    assert "#include <mma.h>" not in src
