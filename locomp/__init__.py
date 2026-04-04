@@ -6,6 +6,7 @@ Write GPU kernels in Python, compile to native Metal shaders.
 from locomp.autotune import Config, autotune, clear_cache
 from locomp.frontend import LocompKernelError
 from locomp.cache import clear as clear_kernel_cache, cache_dir as kernel_cache_dir
+from locomp.graph import graph, KernelGraph
 from locomp.api import (
     kernel,
     program_id,
@@ -90,6 +91,8 @@ __all__ = [
     "clear_cache",
     "clear_kernel_cache",
     "kernel_cache_dir",
+    "graph",
+    "KernelGraph",
     "LocompKernelError",
     "kernel",
     "program_id",
