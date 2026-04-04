@@ -4,6 +4,7 @@ import locomp
 from locomp.frontend import compile_kernel, Tensor, constexpr
 from locomp.backends.metal_codegen import compile_to_metal
 from locomp.ir import OpCode, IRType
+from tests.conftest import macos_only
 
 
 def test_reduce_sum_global_produces_ir_op():
@@ -45,6 +46,7 @@ def test_reduce_min_global_produces_ir_op():
     assert len(reduce_ops[0].operands) == 2
 
 
+@macos_only
 def test_reduce_sum_msl_uses_simd_and_atomic():
     """reduce_sum emits simd_sum + atomic_fetch_add in MSL."""
     @locomp.kernel
@@ -59,6 +61,7 @@ def test_reduce_sum_msl_uses_simd_and_atomic():
     assert "simd_lid" in msl
 
 
+@macos_only
 def test_reduce_max_msl_uses_simd_and_cas():
     """reduce_max emits simd_max + CAS atomic pattern in MSL."""
     @locomp.kernel
@@ -72,6 +75,7 @@ def test_reduce_max_msl_uses_simd_and_cas():
     assert "atomic_compare_exchange_weak_explicit" in msl
 
 
+@macos_only
 def test_reduce_min_msl_uses_simd_and_cas():
     """reduce_min emits simd_min + CAS atomic pattern in MSL."""
     @locomp.kernel
@@ -85,6 +89,7 @@ def test_reduce_min_msl_uses_simd_and_cas():
     assert "atomic_compare_exchange_weak_explicit" in msl
 
 
+@macos_only
 def test_tile_sum_still_works():
     """locomp.sum(tile) — 1-operand tile reduction — still works."""
     @locomp.kernel
@@ -98,6 +103,7 @@ def test_tile_sum_still_works():
     assert "+=" in msl  # tile reduction loop
 
 
+@macos_only
 def test_tile_max_works():
     """locomp.max(tile) — 1-operand tile max reduction."""
     @locomp.kernel
@@ -111,6 +117,7 @@ def test_tile_max_works():
     assert "max(" in msl
 
 
+@macos_only
 def test_tile_min_works():
     """locomp.min(tile) — 1-operand tile min reduction."""
     @locomp.kernel

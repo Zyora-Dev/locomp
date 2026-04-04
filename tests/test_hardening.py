@@ -5,6 +5,7 @@ import pytest
 import locomp
 from locomp.frontend import compile_kernel, constexpr, Tensor
 from locomp.ir import OpCode, IRType, IRValue
+from tests.conftest import macos_only
 
 
 # --- Float16 support ---
@@ -32,6 +33,7 @@ def test_float32_shared_memory_ir():
     assert size == 128
 
 
+@macos_only
 def test_float16_shared_memory_codegen():
     """Float16 shared memory emits 'threadgroup half' in MSL."""
     @locomp.kernel
@@ -42,6 +44,7 @@ def test_float16_shared_memory_codegen():
     assert "threadgroup half smem_0[32];" in msl
 
 
+@macos_only
 def test_float32_shared_memory_codegen():
     """Float32 shared memory emits 'threadgroup float' in MSL."""
     @locomp.kernel
@@ -119,6 +122,7 @@ def test_barrier_ir():
     assert OpCode.BARRIER in opcodes
 
 
+@macos_only
 def test_barrier_codegen():
     """barrier() emits threadgroup_barrier in MSL."""
     @locomp.kernel
@@ -131,6 +135,7 @@ def test_barrier_codegen():
 
 # --- Multi-dimensional local_id ---
 
+@macos_only
 def test_local_id_axes():
     """local_id(0/1/2) maps to lid.x/y/z in MSL."""
     @locomp.kernel
@@ -151,6 +156,7 @@ def test_local_id_axes():
 
 # --- Range with 3 args ---
 
+@macos_only
 def test_range_3_args_codegen():
     """range(start, end, step) generates correct MSL for-loop."""
     @locomp.kernel
@@ -167,6 +173,7 @@ def test_range_3_args_codegen():
 
 # --- End-to-end GPU tests ---
 
+@macos_only
 def test_shared_memory_store_load_roundtrip():
     """Write to shared memory and read back — values must match."""
     @locomp.kernel
@@ -188,6 +195,7 @@ def test_shared_memory_store_load_roundtrip():
     np.testing.assert_allclose(result, x, atol=1e-6)
 
 
+@macos_only
 def test_cooperative_smem_load():
     """Threads cooperatively load into shared memory, then read each other's values."""
     @locomp.kernel
@@ -214,6 +222,7 @@ def test_cooperative_smem_load():
     np.testing.assert_allclose(result, expected, atol=1e-6)
 
 
+@macos_only
 def test_conv2d_small():
     """Small Conv2D correctness test — 1×1×4×4 → 2×3×3."""
     @locomp.kernel

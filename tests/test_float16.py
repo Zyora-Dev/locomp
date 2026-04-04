@@ -4,6 +4,7 @@ import locomp
 from locomp.frontend import compile_kernel, Float16, constexpr
 from locomp.backends.metal_codegen import compile_to_metal
 from locomp.ir import IRType, OpCode
+from tests.conftest import macos_only
 
 
 def test_float16_param_ir_type():
@@ -31,6 +32,7 @@ def test_float16_load_dtype():
     assert load_ops[0].result.dtype == IRType.FLOAT16
 
 
+@macos_only
 def test_float16_msl_uses_half_type():
     """Float16 params compile to MSL 'device half*' buffers."""
     @locomp.kernel
@@ -43,6 +45,7 @@ def test_float16_msl_uses_half_type():
     assert "device half*" in msl
 
 
+@macos_only
 def test_float16_arithmetic_has_explicit_cast():
     """Float16 arithmetic result gets explicit (half)(...) cast in MSL."""
     @locomp.kernel
@@ -56,6 +59,7 @@ def test_float16_arithmetic_has_explicit_cast():
     assert "(half)" in msl
 
 
+@macos_only
 def test_float16_cast_to_float32_in_msl():
     """locomp.cast(val, 'float32') from Float16 emits (float) cast."""
     @locomp.kernel

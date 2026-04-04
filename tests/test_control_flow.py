@@ -4,6 +4,7 @@ import numpy as np
 import locomp
 from locomp.frontend import compile_kernel, constexpr, Tensor, Int32, Bool
 from locomp.ir import OpCode
+from tests.conftest import macos_only
 
 
 # --- Frontend IR tests ---
@@ -305,6 +306,7 @@ def test_strength_reduce_mul2():
 
 # --- End-to-end GPU tests (small sizes only) ---
 
+@macos_only
 def test_if_else_end_to_end():
     @locomp.kernel
     def k(X: locomp.Tensor, OUT: locomp.Tensor, N: locomp.constexpr):
@@ -327,6 +329,7 @@ def test_if_else_end_to_end():
     out_t.free()
 
 
+@macos_only
 def test_tensor_free():
     from locomp.backends.metal_runtime import get_runtime
     rt = get_runtime()
