@@ -1,0 +1,75 @@
+name: RISC-V RVV Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  #  Job 1: Normal tests (macOS / Linux, Metal codegen, no RISC-V hardware)
+  # ──────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (codegen + IR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install locomp
+        run: pip install -e ".[dev]"
+
+      - name: Run all non-execution tests
+        run: |
+          pytest tests/ \
+            --ignore=tests/test_riscv_execution.py \
+            -v --tb=short
+
+  # ──────────────────────────────────────────────────────────────────────────
+  #  Job 2: RISC-V execution tests — QEMU + cross-compiler (free GitHub runner)
+  # ──────────────────────────────────────────────────────────────────────────
+  riscv-execution:
+    name: RISC-V RVV Execution (QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install RISC-V toolchain + QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            qemu-user-static \
+            gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu
+
+      - name: Verify toolchain
+        run: |
+          riscv64-linux-gnu-gcc --version
+          qemu-riscv64-static --version
+
+      - name: Install locomp
+        run: pip install -e ".[dev]"
+
+      - name: Run RISC-V execution tests
+        run: |
+          pytest tests/test_riscv_execution.py \
+            -v --tb=long \
+            -p no:cacheprovider
+
+      - name: Upload generated C sources on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv-c-sources
+          path: /tmp/locomp_riscv_*.c
+          if-no-files-found: ignore

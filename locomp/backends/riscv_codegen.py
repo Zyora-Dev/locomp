@@ -393,7 +393,7 @@ class RISCVCodegen:
                 continue
             ctype = _c_type(p.dtype)
             if p.is_pointer:
-                lines.append(f"    {ctype}* {base} = ({ctype}*)*((void**)_args[{idx}]);")
+                lines.append(f"    {ctype}* {base} = ({ctype}*)_args[{idx}];")
             else:
                 lines.append(f"    {ctype} {base} = *({ctype}*)_args[{idx}];")
             idx += 1
