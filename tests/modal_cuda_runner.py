@@ -1,37 +1,25 @@
 """
-locomp CUDA backend — Modal test + benchmark script.
-
-Tests the CUDA codegen on a real NVIDIA GPU via Modal.
+locomp CUDA backend — Modal benchmark + correctness script.
 
 Run with:
-    modal run tests/test_cuda_modal.py
+    modal run tests/modal_cuda_runner.py
 
-Requirements:
-    pip install modal
-    modal token new   # first time only
-
-What this tests:
-  1. vector_add       — basic load/store/arithmetic
-  2. scale_shift      — scalar multiply + add
-  3. relu             — conditional (where/max)
-  4. reduce_sum       — atomic reduction across blocks
-  5. tiled_add        — tiled (arange) load/store with loops
-  6. dot_product      — for-loop accumulation
-  7. rms_norm         — sqrt + reduce + divide
-  8. softmax          — exp + reduce + divide (3-pass)
-
-Each test compiles the kernel to CUDA C via locomp, launches it on an A10G,
-and compares output to NumPy reference. Reports max absolute error and timing.
+Benchmarks (A10G):
+  - 16M-element kernels: vector_add, scale_shift, relu, sqrt_exp
+  - dot_product (64 x 1024 accumulation)
+  - shared_memory  — __shared__ correctness test
+  - float16        — half-precision load/store/arithmetic
+  Reports max absolute error, warm kernel time (ms), and memory throughput (GB/s).
 """
 
 import modal
 import numpy as np
 
-app = modal.App("locomp-cuda-tests")
+app = modal.App("locomp-cuda-benchmarks")
 
-# Install locomp from the local source (editable install)
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git")
     .pip_install("numpy")
     .run_commands(
         "pip install git+https://github.com/Zyora-Dev/locomp.git@main",
@@ -40,187 +28,207 @@ image = (
 
 
 @app.function(gpu="A10G", image=image, timeout=300)
-def run_cuda_tests():
+def run_cuda_benchmarks():
     import locomp
     import numpy as np
     import subprocess
     import ctypes
     import tempfile
     import os
+    import time
     from locomp.frontend import compile_kernel
     from locomp.optimizer import optimize
     from locomp.backends.cuda_codegen import compile_to_cuda
 
-    results = []
+    libcudart = ctypes.CDLL("libcudart.so")
+    libcudart.cudaMalloc.restype = ctypes.c_int
+    libcudart.cudaMemcpy.restype = ctypes.c_int
+    libcudart.cudaFree.restype = ctypes.c_int
+    libcudart.cudaDeviceSynchronize.restype = ctypes.c_int
+    H2D, D2H = 1, 2
 
-    def compile_and_run(name, fn, constexpr_values, grid, block, inputs, expected_fn):
-        """Compile kernel to CUDA, run it, compare to NumPy."""
+    _so_cache = {}
+
+    def _build_so(fn, constexpr_values):
+        import hashlib, shutil
         ir = compile_kernel(fn)
         ir = optimize(ir, target="cuda")
         cuda_src, param_map = compile_to_cuda(ir, constexpr_values=constexpr_values)
-
-        # Write .cu and compile with nvcc
+        key = hashlib.sha256(cuda_src.encode()).hexdigest()
+        if key in _so_cache:
+            return _so_cache[key], param_map, cuda_src
         with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
-            f.write(cuda_src)
-            cu_path = f.name
-        so_path = cu_path.replace(".cu", ".so")
-
+            f.write(cuda_src); cu = f.name
+        so = cu.replace(".cu", ".so")
         r = subprocess.run(
-            ["nvcc", "-arch=sm_86", "-O2", "-shared", "-Xcompiler", "-fPIC",
-             "-o", so_path, cu_path],
-            capture_output=True, text=True
-        )
-        os.unlink(cu_path)
+            ["nvcc", "-arch=sm_86", "-O3", "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
+            capture_output=True, text=True)
+        os.unlink(cu)
         if r.returncode != 0:
-            results.append({"name": name, "status": "COMPILE_ERROR", "error": r.stderr[:500]})
-            return
+            raise RuntimeError(f"nvcc failed:\n{r.stderr[:800]}")
+        _so_cache[key] = so
+        return so, param_map, cuda_src
 
-        lib = ctypes.CDLL(so_path)
-        launch_fn = getattr(lib, f"locomp_launch_{fn.__name__}")
-        launch_fn.argtypes = [
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        launch_fn.restype = None
+    def alloc_device(arr):
+        d = ctypes.c_void_p()
+        libcudart.cudaMalloc(ctypes.byref(d), arr.nbytes)
+        libcudart.cudaMemcpy(d, arr.ctypes.data_as(ctypes.c_void_p), arr.nbytes, H2D)
+        return d
 
-        # Allocate CUDA device memory and copy inputs
-        import ctypes as ct
-        libcudart = ctypes.CDLL("libcudart.so")
-        libcudart.cudaMalloc.restype = ctypes.c_int
-        libcudart.cudaMemcpy.restype = ctypes.c_int
-        libcudart.cudaFree.restype = ctypes.c_int
-        CUDA_MEMCPY_HOST_TO_DEVICE = 1
-        CUDA_MEMCPY_DEVICE_TO_HOST = 2
+    def read_device(d, arr):
+        out = arr.copy()
+        libcudart.cudaMemcpy(out.ctypes.data_as(ctypes.c_void_p), d, arr.nbytes, D2H)
+        return out
 
-        d_ptrs = []
-        h_arrays = list(inputs)
-        for arr in h_arrays:
-            d_ptr = ctypes.c_void_p()
-            libcudart.cudaMalloc(ctypes.byref(d_ptr), arr.nbytes)
-            libcudart.cudaMemcpy(d_ptr, arr.ctypes.data_as(ctypes.c_void_p),
-                                 arr.nbytes, CUDA_MEMCPY_HOST_TO_DEVICE)
-            d_ptrs.append(d_ptr)
-
-        arr_type = (ctypes.c_void_p * len(d_ptrs))
-        c_arr = arr_type(*[p.value for p in d_ptrs])
-
-        import time
-        t0 = time.perf_counter()
-        launch_fn(
-            ctypes.c_int(grid[0]), ctypes.c_int(grid[1] if len(grid) > 1 else 1),
-            ctypes.c_int(block[0]), ctypes.c_int(block[1] if len(block) > 1 else 1),
-            ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p))
-        )
+    def run_kernel(so, fn_name, grid, block, d_ptrs, n_iters=1):
+        lib = ctypes.CDLL(so)
+        fn = getattr(lib, fn_name)
+        fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                       ctypes.POINTER(ctypes.c_void_p)]
+        fn.restype = None
+        arr_t = (ctypes.c_void_p * len(d_ptrs))
+        c_arr = arr_t(*[p.value for p in d_ptrs])
         libcudart.cudaDeviceSynchronize()
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        for _ in range(n_iters):
+            fn(grid[0], grid[1] if len(grid) > 1 else 1,
+               block[0], block[1] if len(block) > 1 else 1,
+               ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p)))
+        libcudart.cudaDeviceSynchronize()
+        return (time.perf_counter() - t0) * 1000 / n_iters  # ms per call
 
-        # Copy output back (last array is output by convention)
-        out_arr = h_arrays[-1].copy()
-        libcudart.cudaMemcpy(out_arr.ctypes.data_as(ctypes.c_void_p),
-                             d_ptrs[-1], out_arr.nbytes, CUDA_MEMCPY_DEVICE_TO_HOST)
+    results = []
 
-        for p in d_ptrs:
-            libcudart.cudaFree(p)
-        os.unlink(so_path)
+    def bench(name, fn, cv, grid, block, inputs, expected_fn, bytes_rw, dtype=np.float32):
+        try:
+            so, _, _ = _build_so(fn, cv)
+            d_ptrs = [alloc_device(a) for a in inputs]
+            # warmup
+            run_kernel(so, f"locomp_launch_{fn.__name__}", grid, block, d_ptrs, n_iters=3)
+            # timed
+            ms = run_kernel(so, f"locomp_launch_{fn.__name__}", grid, block, d_ptrs, n_iters=20)
+            out = read_device(d_ptrs[-1], inputs[-1])
+            for p in d_ptrs:
+                libcudart.cudaFree(p)
+            exp = expected_fn(*inputs[:-1])
+            tol = 1e-2 if dtype in (np.float16,) else 1e-4
+            max_err = float(np.max(np.abs(out.astype(np.float32) - exp.astype(np.float32))))
+            status = "PASS" if max_err < tol else "FAIL"
+            gbps = (bytes_rw / 1e9) / (ms / 1000)
+            results.append({"name": name, "status": status, "max_err": max_err,
+                            "ms": ms, "gbps": gbps})
+        except Exception as e:
+            results.append({"name": name, "status": "ERROR", "error": str(e)[:200]})
 
-        expected = expected_fn(*inputs[:-1])
-        max_err = float(np.max(np.abs(out_arr - expected)))
-        status = "PASS" if max_err < 1e-4 else "FAIL"
-        results.append({
-            "name": name, "status": status,
-            "max_err": max_err, "time_ms": elapsed_ms
-        })
-
-    N = 1024
-
-    # ── 1. vector_add ────────────────────────────────────────────────────────
-    def vector_add(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+    # ── 1. vector_add  16M ────────────────────────────────────────────────────
+    N = 16 * 1024 * 1024
+    def vector_add(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
+                   N: locomp.constexpr):
         i = locomp.program_id(0)
-        a = locomp.load(A + i)
-        b = locomp.load(B + i)
-        locomp.store(Out + i, a + b)
-
+        locomp.store(Out + i, locomp.load(A + i) + locomp.load(B + i))
     a = np.random.randn(N).astype(np.float32)
     b = np.random.randn(N).astype(np.float32)
-    out = np.zeros(N, dtype=np.float32)
-    compile_and_run("vector_add", vector_add, {"N": N}, (N,), (1,),
-                    [a, b, out], lambda a, b: a + b)
+    bench("vector_add (16M f32)", vector_add, {"N": N}, (N,), (1,),
+          [a, b, np.zeros(N, dtype=np.float32)],
+          lambda a, b: a + b, 3 * N * 4)
 
-    # ── 2. scale_shift ───────────────────────────────────────────────────────
+    # ── 2. scale_shift  16M ───────────────────────────────────────────────────
     def scale_shift(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         i = locomp.program_id(0)
-        x = locomp.load(X + i)
-        locomp.store(Out + i, x * 2.0 + 1.0)
-
+        locomp.store(Out + i, locomp.load(X + i) * 2.0 + 1.0)
     x = np.random.randn(N).astype(np.float32)
-    out = np.zeros(N, dtype=np.float32)
-    compile_and_run("scale_shift", scale_shift, {"N": N}, (N,), (1,),
-                    [x, out], lambda x: x * 2.0 + 1.0)
+    bench("scale_shift (16M f32)", scale_shift, {"N": N}, (N,), (1,),
+          [x, np.zeros(N, dtype=np.float32)],
+          lambda x: x * 2.0 + 1.0, 2 * N * 4)
 
-    # ── 3. relu ──────────────────────────────────────────────────────────────
+    # ── 3. relu  16M ──────────────────────────────────────────────────────────
     def relu(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         i = locomp.program_id(0)
         x = locomp.load(X + i)
-        y = locomp.where(x > 0.0, x, 0.0)
-        locomp.store(Out + i, y)
-
+        locomp.store(Out + i, locomp.where(x > 0.0, x, 0.0))
     x = np.random.randn(N).astype(np.float32)
-    out = np.zeros(N, dtype=np.float32)
-    compile_and_run("relu", relu, {"N": N}, (N,), (1,),
-                    [x, out], lambda x: np.maximum(x, 0.0))
+    bench("relu (16M f32)", relu, {"N": N}, (N,), (1,),
+          [x, np.zeros(N, dtype=np.float32)],
+          lambda x: np.maximum(x, 0.0), 2 * N * 4)
 
-    # ── 4. dot_product (for-loop accumulation) ───────────────────────────────
-    M = 64
+    # ── 4. sqrt_exp  16M ──────────────────────────────────────────────────────
+    def sqrt_exp(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+        i = locomp.program_id(0)
+        x = locomp.load(X + i)
+        locomp.store(Out + i, locomp.exp(locomp.sqrt(locomp.abs(x))))
+    x = np.random.randn(N).astype(np.float32)
+    bench("sqrt_exp (16M f32)", sqrt_exp, {"N": N}, (N,), (1,),
+          [x, np.zeros(N, dtype=np.float32)],
+          lambda x: np.exp(np.sqrt(np.abs(x))), 2 * N * 4)
+
+    # ── 5. dot_product  64 x 1024 ────────────────────────────────────────────
+    M, K = 64, 1024
     def dot_product(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
                     N: locomp.constexpr):
         i = locomp.program_id(0)
         acc = 0.0
         for k in range(N):
-            a = locomp.load(A + i * N + k)
-            b = locomp.load(B + i * N + k)
-            acc = acc + a * b
+            acc = acc + locomp.load(A + i * N + k) * locomp.load(B + i * N + k)
         locomp.store(Out + i, acc)
+    a2 = np.random.randn(M, K).astype(np.float32)
+    b2 = np.random.randn(M, K).astype(np.float32)
+    bench("dot_product (64x1024)", dot_product, {"N": K}, (M,), (1,),
+          [a2.flatten(), b2.flatten(), np.zeros(M, dtype=np.float32)],
+          lambda a, b: (a.reshape(M, K) * b.reshape(M, K)).sum(axis=1),
+          (2 * M * K + M) * 4)
 
-    a = np.random.randn(M, N).astype(np.float32)
-    b = np.random.randn(M, N).astype(np.float32)
-    out = np.zeros(M, dtype=np.float32)
-    compile_and_run("dot_product", dot_product, {"N": N}, (M,), (1,),
-                    [a.flatten(), b.flatten(), out],
-                    lambda a, b: (a.reshape(M, N) * b.reshape(M, N)).sum(axis=1))
+    # ── 6. shared_memory correctness ─────────────────────────────────────────
+    BS = 256
+    Ns = BS * 128  # 32768 elements, 128 blocks of 256 threads
+    def smem_copy(A: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+        """Copy through shared memory: load to smem, barrier, store from smem."""
+        tile = locomp.shared_memory(256, locomp.float32)
+        block_id = locomp.program_id(0)
+        tid = locomp.local_id(0)
+        idx = block_id * 256 + tid
+        locomp.shared_store(tile, tid, locomp.load(A + idx))
+        locomp.barrier()
+        locomp.store(Out + idx, locomp.shared_load(tile, tid))
+    a3 = np.random.randn(Ns).astype(np.float32)
+    bench("shared_memory copy", smem_copy, {"N": Ns}, (Ns // BS,), (BS,),
+          [a3, np.zeros(Ns, dtype=np.float32)],
+          lambda a: a, 2 * Ns * 4)
 
-    # ── 5. sqrt_exp ──────────────────────────────────────────────────────────
-    def sqrt_exp(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+    # ── 7. float16  16M ───────────────────────────────────────────────────────
+    N16 = 4 * 1024 * 1024  # 4M half-precision elements
+    def fp16_scale(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         i = locomp.program_id(0)
-        x = locomp.load(X + i)
-        y = locomp.exp(locomp.sqrt(locomp.abs(x)))
-        locomp.store(Out + i, y)
-
-    x = np.random.randn(N).astype(np.float32)
-    out = np.zeros(N, dtype=np.float32)
-    compile_and_run("sqrt_exp", sqrt_exp, {"N": N}, (N,), (1,),
-                    [x, out], lambda x: np.exp(np.sqrt(np.abs(x))))
+        locomp.store(Out + i, locomp.load(X + i) * 2.0)
+    x16 = np.random.randn(N16).astype(np.float16)
+    bench("fp16_scale (4M f16)", fp16_scale, {"N": N16}, (N16,), (1,),
+          [x16, np.zeros(N16, dtype=np.float16)],
+          lambda x: (x * 2.0).astype(np.float16), 2 * N16 * 2, dtype=np.float16)
 
     return results
 
 
 @app.local_entrypoint()
 def main():
-    results = run_cuda_tests.remote()
-    print("\n" + "="*60)
-    print("locomp CUDA Backend — Modal A10G Test Results")
-    print("="*60)
-    passed = 0
-    failed = 0
+    results = run_cuda_benchmarks.remote()
+    print(flush=True)
+    print("=" * 70, flush=True)
+    print("  locomp CUDA Backend — Modal A10G Benchmark Results", flush=True)
+    print("=" * 70, flush=True)
+    print(f"  {'Kernel':<28} {'Status':<8} {'MaxErr':>10} {'Time':>9} {'GB/s':>10}", flush=True)
+    print("-" * 70, flush=True)
+    passed = failed = 0
     for r in results:
-        if r["status"] == "PASS":
-            print(f"  PASS  {r['name']:20s}  max_err={r['max_err']:.2e}  {r['time_ms']:.3f}ms")
+        if r["status"] == "ERROR":
+            print(f"  {r['name']:<28} {'ERROR':<8}  {r['error'][:30]}", flush=True)
+            failed += 1
+        elif r["status"] == "PASS":
+            print(f"  {r['name']:<28} {'PASS':<8} {r['max_err']:>10.2e} {r['ms']:>7.3f}ms {r['gbps']:>8.1f}", flush=True)
             passed += 1
-        elif r["status"] == "COMPILE_ERROR":
-            print(f"  ERROR {r['name']:20s}  {r['error'][:80]}")
-            failed += 1
         else:
-            print(f"  FAIL  {r['name']:20s}  max_err={r['max_err']:.2e}")
+            print(f"  {r['name']:<28} {'FAIL':<8} {r['max_err']:>10.2e}", flush=True)
             failed += 1
-    print("="*60)
-    print(f"  {passed} passed, {failed} failed")
-    print("="*60)
+    print("=" * 70, flush=True)
+    print(f"  {passed} passed, {failed} failed", flush=True)
+    print("=" * 70, flush=True)
+
+
