@@ -34,7 +34,7 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .pip_install("numpy")
     .run_commands(
-        "pip install locomp",  # installs from PyPI
+        "pip install git+https://github.com/Zyora-Dev/locomp.git@main",
     )
 )
 
