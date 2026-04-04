@@ -706,6 +706,8 @@ class RISCVCodegen:
         if ptr_val.id in self._ptr_exprs:
             base, idx = self._ptr_exprs[ptr_val.id]
             ptr_expr = f"({base} + {idx})"
+        elif ptr_val.is_pointer:
+            ptr_expr = self._vname(ptr_val)  # already a float* variable
         else:
             ptr_expr = self._vname(ptr_val)
 
@@ -791,6 +793,14 @@ class RISCVCodegen:
         a = self._vname(op.operands[0])
         b = self._vname(op.operands[1])
         ct = _c_type(op.result.dtype)
+
+        # Pointer arithmetic: if either operand is a pointer, result is a pointer
+        a_ptr = op.operands[0].is_pointer or op.operands[0].id in self._ptr_exprs
+        b_ptr = op.operands[1].is_pointer or op.operands[1].id in self._ptr_exprs
+        if (op.opcode == OpCode.ADD) and (a_ptr or b_ptr):
+            self._ptr_exprs[op.result.id] = (a if a_ptr else b,
+                                             b if a_ptr else a)
+            return f"{ct}* {rv} = {a} + {b};"
 
         sym_map = {OpCode.ADD: "+", OpCode.SUB: "-", OpCode.MUL: "*",
                    OpCode.DIV: "/", OpCode.MOD: "%"}
