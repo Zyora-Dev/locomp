@@ -20,6 +20,7 @@ from locomp.frontend import compile_kernel, constexpr, Tensor, Float16, BFloat16
 from locomp.ir import IRKernel
 from locomp.optimizer import optimize
 from locomp.backends.metal_codegen import compile_to_metal
+from locomp.backends.riscv_codegen import compile_to_riscv
 
 
 # Re-export types for user annotations

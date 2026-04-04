@@ -1,9 +1,15 @@
 """Tests for 2D grid dispatch — chained pointer arithmetic and 2D program_id."""
 
+import platform
+import pytest
 import locomp
 from locomp.frontend import compile_kernel, Tensor, constexpr
 from locomp.backends.metal_codegen import compile_to_metal
 from locomp.ir import OpCode, IRType
+
+pytestmark = pytest.mark.skipif(
+    platform.system() != "Darwin", reason="Metal/MSL tests require macOS"
+)
 
 
 def test_program_id_axis1_emits_tgid_y():

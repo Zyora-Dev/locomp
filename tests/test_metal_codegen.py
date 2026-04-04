@@ -1,7 +1,13 @@
 """Tests for Metal codegen — IR → MSL compilation."""
 
+import platform
+import pytest
 import locomp
 from locomp.backends.metal_codegen import compile_to_metal
+
+pytestmark = pytest.mark.skipif(
+    platform.system() != "Darwin", reason="Metal/MSL tests require macOS"
+)
 
 
 def test_vector_add_generates_msl():
