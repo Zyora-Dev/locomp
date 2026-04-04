@@ -428,6 +428,17 @@ class _KernelCall:
         self.launcher._compile()
 
         if self.launcher.backend == "metal":
+            from locomp.profiler import get_active_profiler
+            prof = get_active_profiler()
+            if prof is not None:
+                import time
+                from locomp.backends.metal_runtime import get_runtime
+                t0 = time.perf_counter()
+                result = self._launch_metal(*args, **kwargs)
+                get_runtime().sync()
+                prof.record(self.launcher.func_name, self.grid,
+                            (time.perf_counter() - t0) * 1000)
+                return result
             return self._launch_metal(*args, **kwargs)
         else:
             raise NotImplementedError(f"Backend '{self.launcher.backend}' not implemented")
@@ -544,7 +555,90 @@ def hardware_info() -> dict:
     return get_runtime().hardware_info()
 
 
-# --- Kernel primitive functions (used inside @kernel functions) ---
+# ---------------------------------------------------------------------------
+# embed_lookup — GPU embedding table lookup (avoids CPU round-trip)
+# ---------------------------------------------------------------------------
+
+def embed_lookup(token_ids, table: "LocompTensor", out: "LocompTensor",
+                 seq_len: int, dim: int) -> None:
+    """GPU embedding lookup: out[i] = table[token_ids[i]] for i in range(seq_len).
+
+    Args:
+        token_ids: 1-D Int32 LocompTensor of shape (seq_len,)
+        table:     2-D LocompTensor of shape (vocab, dim) — float32 or float16
+        out:       1-D LocompTensor of shape (seq_len * dim,) — same dtype as table
+        seq_len:   number of tokens
+        dim:       embedding dimension
+    """
+    from locomp._builtin_kernels import _embed_fp32, _embed_fp16
+    k = _embed_fp16 if table.dtype == np.float16 else _embed_fp32
+    k[(seq_len, dim)](token_ids, table, out, DIM=dim)
+
+
+# ---------------------------------------------------------------------------
+# @locomp.jit — auto-grid decorator (infers grid from first tensor argument)
+# ---------------------------------------------------------------------------
+
+class JITKernelLauncher:
+    """Wraps a KernelLauncher and infers the grid from the first tensor arg's size."""
+
+    def __init__(self, launcher: "KernelLauncher", grid_fn=None):
+        self._launcher = launcher
+        self._grid_fn = grid_fn  # optional callable(first_tensor) → grid tuple
+
+    def __call__(self, *args, **kwargs):
+        """Auto-dispatch: grid = first tensor's total element count."""
+        # Find first tensor arg to infer grid
+        first_tensor = None
+        for a in args:
+            if isinstance(a, LocompTensor):
+                first_tensor = a
+                break
+        if first_tensor is None:
+            raise ValueError(
+                "@locomp.jit requires at least one LocompTensor argument "
+                "to infer the dispatch grid"
+            )
+        if self._grid_fn is not None:
+            grid = self._grid_fn(first_tensor)
+        else:
+            grid = (first_tensor.size,)
+        return self._launcher[grid](*args, **kwargs)
+
+    # Forward attribute access so .msl, .ir, etc. still work
+    def __getattr__(self, name):
+        return getattr(self._launcher, name)
+
+    def __repr__(self):
+        return f"JITKernelLauncher({self._launcher.func_name})"
+
+
+def jit(func=None, *, grid=None, backend: str = "auto"):
+    """Decorator that auto-infers the dispatch grid from the first tensor argument.
+
+    Usage:
+        @locomp.jit
+        def gelu(X: locomp.Tensor, O: locomp.Tensor, N: locomp.constexpr):
+            i = locomp.program_id(0)
+            ...
+
+        gelu(x, out, N=N)   # grid auto = x.size — no [(N,)] needed
+
+    Custom grid:
+        @locomp.jit(grid=lambda t: (t.shape[0], t.shape[1]))
+        def matmul(A, B, C, M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
+            ...
+    """
+    if func is not None:
+        launcher = KernelLauncher(func, backend=backend)
+        return JITKernelLauncher(launcher, grid_fn=grid)
+
+    def decorator(f):
+        launcher = KernelLauncher(f, backend=backend)
+        return JITKernelLauncher(launcher, grid_fn=grid)
+    return decorator
+
+
 # These are never actually called at runtime — the AST compiler intercepts them.
 # They exist for IDE autocomplete and type checking.
 

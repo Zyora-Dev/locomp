@@ -7,6 +7,7 @@ from locomp.autotune import Config, autotune, clear_cache
 from locomp.frontend import LocompKernelError
 from locomp.cache import clear as clear_kernel_cache, cache_dir as kernel_cache_dir
 from locomp.graph import graph, KernelGraph
+from locomp.profiler import profile, Profiler, ProfileResult
 from locomp.api import (
     kernel,
     program_id,
@@ -74,6 +75,9 @@ from locomp.api import (
     ones,
     hardware_info,
     set_device,
+    embed_lookup,
+    jit,
+    JITKernelLauncher,
     constexpr,
     Tensor,
     Float16,
@@ -84,7 +88,7 @@ from locomp.api import (
     Bool,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __all__ = [
     "Config",
     "autotune",
@@ -93,6 +97,9 @@ __all__ = [
     "kernel_cache_dir",
     "graph",
     "KernelGraph",
+    "profile",
+    "Profiler",
+    "ProfileResult",
     "LocompKernelError",
     "kernel",
     "program_id",
@@ -163,6 +170,9 @@ __all__ = [
     "reduce_min",
     "hardware_info",
     "set_device",
+    "embed_lookup",
+    "jit",
+    "JITKernelLauncher",
     "constexpr",
     "Tensor",
     "Float16",
