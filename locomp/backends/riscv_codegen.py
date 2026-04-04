@@ -316,7 +316,9 @@ class RISCVCodegen:
             if (defined_at_depth.get(rid, 0) > 0
                     and rid in referenced
                     and op.result.aliases is None
-                    and op.opcode not in (OpCode.FOR_LOOP_START, OpCode.CONSTANT)):
+                    and op.opcode not in (OpCode.FOR_LOOP_START, OpCode.CONSTANT)
+                    and not op.result.is_pointer          # never pre-declare pointers
+                    and op.opcode != OpCode.PTR_ADD):     # PTR_ADD result is a pointer
                 var = self._vname(op.result)
                 ctype = _c_type(op.result.dtype)
                 lines.append(f"{self.indent}{ctype} {var};")
@@ -479,7 +481,6 @@ class RISCVCodegen:
             self._ptr_exprs[op.result.id] = (base, offset)
             ct = _c_type(op.result.dtype)
             return f"{ct}* {rv} = {base} + {offset};"
-
         # ── memory ───────────────────────────────────────────────────────────
         elif op.opcode == OpCode.LOAD:
             return self._gen_load(op)
@@ -998,6 +999,9 @@ class RISCVCodegen:
         if result_id not in self._predeclared:
             return line
         stripped = line.lstrip()
+        # Never strip pointer declarations — they can't be pre-declared as scalars
+        if '* ' in stripped.split('=')[0] or stripped.split('=')[0].rstrip().endswith('*'):
+            return line
         for prefix in ("float ", "int ", "double ", "int8_t ", "int16_t ",
                        "int32_t ", "int64_t ", "uint8_t ", "uint16_t ",
                        "uint32_t ", "uint64_t ", "_Float16 "):
