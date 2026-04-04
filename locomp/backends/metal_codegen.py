@@ -809,11 +809,20 @@ class MetalCodegen:
 
     def _gen_store(self, op: IROp) -> str | list[str]:
         """Generate store — resolves ptr expressions to base[index] access."""
+        from locomp.ir import IRType
         ptr = op.operands[0]
         val = op.operands[1]
         mask = op.operands[2] if len(op.operands) > 2 else None
         val_var = self._var(val)
         mask_var = self._var(mask) if mask else None
+
+        # If pointer element type is narrower than value type, emit explicit cast
+        # (MSL rejects implicit float→half/bfloat assignment without cast)
+        ptr_elem_dtype = ptr.dtype  # dtype of the pointed-to element
+        if ptr_elem_dtype in (IRType.FLOAT16, IRType.BFLOAT16):
+            if hasattr(val, 'dtype') and val.dtype not in (IRType.FLOAT16, IRType.BFLOAT16):
+                cast_type = ptr_elem_dtype.to_msl()
+                val_var = f"({cast_type})({val_var})"
 
         if ptr.id in self._ptr_exprs:
             base_ptr, idx_var, is_tiled = self._ptr_exprs[ptr.id]
