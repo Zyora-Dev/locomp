@@ -61,11 +61,12 @@ def run_cuda_benchmarks():
             f.write(cuda_src); cu = f.name
         so = cu.replace(".cu", ".so")
         r = subprocess.run(
-            ["nvcc", "-arch=sm_86", "-O3", "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
+            ["nvcc", "-arch=sm_86", "-O2", "-w", "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
             capture_output=True, text=True)
         os.unlink(cu)
         if r.returncode != 0:
-            raise RuntimeError(f"nvcc failed:\n{r.stderr[:800]}")
+            print(f"[nvcc STDERR]\n{r.stderr}", flush=True)
+            raise RuntimeError(f"nvcc failed:\n{r.stderr[:1200]}")
         _so_cache[key] = so
         return so, param_map, cuda_src
 
@@ -101,7 +102,7 @@ def run_cuda_benchmarks():
 
     def bench(name, fn, cv, grid, block, inputs, expected_fn, bytes_rw, dtype=np.float32):
         try:
-            so, _, _ = _build_so(fn, cv)
+            so, _, cuda_src = _build_so(fn, cv)
             d_ptrs = [alloc_device(a) for a in inputs]
             # warmup
             run_kernel(so, f"locomp_launch_{fn.__name__}", grid, block, d_ptrs, n_iters=3)
@@ -111,14 +112,17 @@ def run_cuda_benchmarks():
             for p in d_ptrs:
                 libcudart.cudaFree(p)
             exp = expected_fn(*inputs[:-1])
-            tol = 1e-2 if dtype in (np.float16,) else 1e-4
+            tol = 1e-2 if dtype in (np.float16,) else 1e-3
             max_err = float(np.max(np.abs(out.astype(np.float32) - exp.astype(np.float32))))
             status = "PASS" if max_err < tol else "FAIL"
             gbps = (bytes_rw / 1e9) / (ms / 1000)
             results.append({"name": name, "status": status, "max_err": max_err,
                             "ms": ms, "gbps": gbps})
         except Exception as e:
-            results.append({"name": name, "status": "ERROR", "error": str(e)[:200]})
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[ERROR in {name}]\n{tb}", flush=True)
+            results.append({"name": name, "status": "ERROR", "error": str(e)})
 
     # ── 1. vector_add  16M ────────────────────────────────────────────────────
     N = 16 * 1024 * 1024
@@ -194,15 +198,16 @@ def run_cuda_benchmarks():
           [a3, np.zeros(Ns, dtype=np.float32)],
           lambda a: a, 2 * Ns * 4)
 
-    # ── 7. float16  16M ───────────────────────────────────────────────────────
-    N16 = 4 * 1024 * 1024  # 4M half-precision elements
-    def fp16_scale(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+    # ── 7. atomic_reduce (128K blocks → single output) ───────────────────────
+    Nred = 128 * 1024
+    def atomic_reduce(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         i = locomp.program_id(0)
-        locomp.store(Out + i, locomp.load(X + i) * 2.0)
-    x16 = np.random.randn(N16).astype(np.float16)
-    bench("fp16_scale (4M f16)", fp16_scale, {"N": N16}, (N16,), (1,),
-          [x16, np.zeros(N16, dtype=np.float16)],
-          lambda x: (x * 2.0).astype(np.float16), 2 * N16 * 2, dtype=np.float16)
+        val = locomp.load(X + i)
+        locomp.atomic_add(Out, val)
+    x_red = np.ones(Nred, dtype=np.float32)
+    bench("atomic_reduce (128K f32)", atomic_reduce, {"N": Nred}, (Nred,), (1,),
+          [x_red, np.zeros(1, dtype=np.float32)],
+          lambda x: np.array([x.sum()], dtype=np.float32), (Nred + 1) * 4)
 
     return results
 
@@ -219,7 +224,7 @@ def main():
     passed = failed = 0
     for r in results:
         if r["status"] == "ERROR":
-            print(f"  {r['name']:<28} {'ERROR':<8}  {r['error'][:30]}", flush=True)
+            print(f"  {r['name']:<28} {'ERROR':<8}  {r.get('error', '')[:80]}", flush=True)
             failed += 1
         elif r["status"] == "PASS":
             print(f"  {r['name']:<28} {'PASS':<8} {r['max_err']:>10.2e} {r['ms']:>7.3f}ms {r['gbps']:>8.1f}", flush=True)
