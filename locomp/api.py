@@ -462,9 +462,17 @@ class _KernelCall:
         # Get or create specialized pipeline for these constexpr values
         constexpr_key = tuple(sorted(constexpr_values.items()))
         if constexpr_key not in self.launcher._specialized:
-            msl_source, buffer_map = compile_to_metal(
-                self.launcher._ir, constexpr_values=constexpr_values
-            )
+            from locomp import cache as _cache
+
+            cached = _cache.get(self.launcher.func, constexpr_values)
+            if cached is not None:
+                msl_source, buffer_map = cached
+            else:
+                msl_source, buffer_map = compile_to_metal(
+                    self.launcher._ir, constexpr_values=constexpr_values
+                )
+                _cache.put(self.launcher.func, constexpr_values, msl_source, buffer_map)
+
             pipeline = runtime.compile_msl(msl_source, self.launcher.func_name)
             self.launcher._specialized[constexpr_key] = (pipeline, buffer_map, msl_source)
             # Update .msl for inspection
