@@ -51,4 +51,4 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: |
-          modal run tests/test_cuda_modal.py
+          modal run tests/modal_cuda_runner.py

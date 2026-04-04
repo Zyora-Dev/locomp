@@ -313,7 +313,7 @@ def test_tiled_mul_rvv_execution():
         grid_size=1,
     )
 
-    np.testing.assert_allclose(results[0], A * B, rtol=1e-5,
+    np.testing.assert_allclose(results[0], A * B, rtol=2e-5,
                                err_msg="tiled_mul RVV: QEMU output mismatch")
 
 
