@@ -171,7 +171,7 @@ class RISCVCodegen:
             self._constexpr_values[k] = v
             # also register under ssa-name if key is already a base name
         self._param_names: list[str] = []   # ordered list of param variable names
-        self._ptr_exprs: dict[int, tuple[str, str]] = {}  # value_id → (base, index)
+        self._ptr_exprs: dict[int, tuple[str, str, bool]] = {}  # value_id → (base, index, is_tiled)
         self._nesting: int = 0
         # Build base-name lookup: strip trailing _<int> suffix from SSA param names
         self._base_names: dict[int, str] = {}   # param.id → base_name
@@ -478,7 +478,7 @@ class RISCVCodegen:
             base = self._vname(op.operands[0])
             offset = self._vname(op.operands[1])
             # Track for later load/store resolution
-            self._ptr_exprs[op.result.id] = (base, offset)
+            self._ptr_exprs[op.result.id] = (base, offset, False)
             ct = _c_type(op.result.dtype)
             return f"{ct}* {rv} = {base} + {offset};"
         # ── memory ───────────────────────────────────────────────────────────
@@ -704,10 +704,14 @@ class RISCVCodegen:
 
         # Resolve pointer expression
         if ptr_val.id in self._ptr_exprs:
-            base, idx = self._ptr_exprs[ptr_val.id]
-            ptr_expr = f"({base} + {idx})"
+            pb, pi, is_tiled = self._ptr_exprs[ptr_val.id]
+            if is_tiled:
+                # arange(0,N) offsets are contiguous: start from pb, use RVV vle
+                ptr_expr = pb
+            else:
+                ptr_expr = f"({pb} + {pi})"
         elif ptr_val.is_pointer:
-            ptr_expr = self._vname(ptr_val)  # already a float* variable
+            ptr_expr = self._vname(ptr_val)
         else:
             ptr_expr = self._vname(ptr_val)
 
@@ -750,12 +754,17 @@ class RISCVCodegen:
         val_val = op.operands[1]
 
         if ptr_val.id in self._ptr_exprs:
-            base, idx = self._ptr_exprs[ptr_val.id]
-            ptr_expr = f"({base} + {idx})"
+            pb, pi, is_tiled = self._ptr_exprs[ptr_val.id]
+            if is_tiled:
+                # arange(0,N) offsets are contiguous: store from pb, use RVV vse
+                val = self._vname(val_val)
+                ptr_expr = pb
+            else:
+                ptr_expr = f"({pb} + {pi})"
+                val = self._vname(val_val)
         else:
             ptr_expr = self._vname(ptr_val)
-
-        val = self._vname(val_val)
+            val = self._vname(val_val)
 
         # Tiled store → RVV vector store
         if val_val.shape:
@@ -794,17 +803,31 @@ class RISCVCodegen:
         b = self._vname(op.operands[1])
         ct = _c_type(op.result.dtype)
 
-        # Pointer arithmetic: if either operand is a pointer, result is a pointer
-        a_ptr = op.operands[0].is_pointer or op.operands[0].id in self._ptr_exprs
-        b_ptr = op.operands[1].is_pointer or op.operands[1].id in self._ptr_exprs
+        # Pointer arithmetic: if either operand is a (scalar) pointer, result is a pointer.
+        # But if the OTHER operand is a tile/array (has shape), this is a gather-address
+        # expression — don't emit a C pointer var, just track and handle in load/store.
+        a_ptr = op.operands[0].is_pointer or (op.operands[0].id in self._ptr_exprs)
+        b_ptr = op.operands[1].is_pointer or (op.operands[1].id in self._ptr_exprs)
         if (op.opcode == OpCode.ADD) and (a_ptr or b_ptr):
-            self._ptr_exprs[op.result.id] = (a if a_ptr else b,
-                                             b if a_ptr else a)
-            return f"{ct}* {rv} = {a} + {b};"
+            ptr_op  = op.operands[0] if a_ptr else op.operands[1]
+            idx_op  = op.operands[1] if a_ptr else op.operands[0]
+            ptr_var = a if a_ptr else b
+            idx_var = b if a_ptr else a
+            # Resolve the base pointer expression
+            if ptr_op.id in self._ptr_exprs:
+                pb, pi, pt = self._ptr_exprs[ptr_op.id]
+                base_expr = f"({pb} + {pi})" if not pt else pb  # for tiled base, use as-is
+            else:
+                base_expr = ptr_var
+            if idx_op.shape:   # tiled index — gather addressing, no C var needed
+                self._ptr_exprs[op.result.id] = (base_expr, idx_var, True)
+                return None    # no C declaration
+            else:              # scalar index — regular pointer arithmetic
+                self._ptr_exprs[op.result.id] = (base_expr, idx_var, False)
+                return f"{ct}* {rv} = {base_expr} + {idx_var};"
 
-        sym_map = {OpCode.ADD: "+", OpCode.SUB: "-", OpCode.MUL: "*",
-                   OpCode.DIV: "/", OpCode.MOD: "%"}
-        sym = sym_map[op.opcode]
+        sym = {OpCode.ADD: "+", OpCode.SUB: "-", OpCode.MUL: "*",
+               OpCode.DIV: "/", OpCode.MOD: "%"}.get(op.opcode, "+")
 
         # Tiled op → RVV vector arithmetic
         if op.result.shape:
@@ -967,8 +990,8 @@ class RISCVCodegen:
         ptr_val = op.operands[0]
         val_val = op.operands[1]
         if ptr_val.id in self._ptr_exprs:
-            base, idx = self._ptr_exprs[ptr_val.id]
-            ptr_expr = f"({base} + {idx})"
+            pb, pi, _tiled = self._ptr_exprs[ptr_val.id]
+            ptr_expr = f"({pb} + {pi})"
         else:
             ptr_expr = self._vname(ptr_val)
         val = self._vname(val_val)
