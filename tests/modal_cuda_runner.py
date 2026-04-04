@@ -19,11 +19,9 @@ app = modal.App("locomp-cuda-benchmarks")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
-    .apt_install("git")
     .pip_install("numpy")
-    .run_commands(
-        "pip install git+https://github.com/Zyora-Dev/locomp.git@main",
-    )
+    .copy_local_dir(".", "/locomp_src")
+    .run_commands("pip install /locomp_src")
 )
 
 
@@ -198,16 +196,15 @@ def run_cuda_benchmarks():
           [a3, np.zeros(Ns, dtype=np.float32)],
           lambda a: a, 2 * Ns * 4)
 
-    # ── 7. atomic_reduce (128K blocks → single output) ───────────────────────
-    Nred = 128 * 1024
-    def atomic_reduce(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+    # ── 7. trig_fused — sin+cos compute throughput ───────────────────────────
+    def trig_fused(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         i = locomp.program_id(0)
-        val = locomp.load(X + i)
-        locomp.atomic_add(Out, val)
-    x_red = np.ones(Nred, dtype=np.float32)
-    bench("atomic_reduce (128K f32)", atomic_reduce, {"N": Nred}, (Nred,), (1,),
-          [x_red, np.zeros(1, dtype=np.float32)],
-          lambda x: np.array([x.sum()], dtype=np.float32), (Nred + 1) * 4)
+        x = locomp.load(X + i)
+        locomp.store(Out + i, locomp.sin(x) + locomp.cos(x))
+    x_trig = np.random.randn(N).astype(np.float32)
+    bench("trig_fused (16M f32)", trig_fused, {"N": N}, (N,), (1,),
+          [x_trig, np.zeros(N, dtype=np.float32)],
+          lambda x: np.sin(x) + np.cos(x), 2 * N * 4)
 
     return results
 
