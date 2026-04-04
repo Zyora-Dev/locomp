@@ -639,7 +639,9 @@ class _KernelCall:
     def _launch_cuda(self, *args, **kwargs):
         """Launch kernel on NVIDIA GPU using compiled CUDA C (.cu via nvcc)."""
         import ctypes
+        import hashlib
         import os
+        import shutil
         import tempfile
         import subprocess
         from locomp.backends.cuda_codegen import compile_to_cuda
@@ -668,27 +670,34 @@ class _KernelCall:
             cuda_source, param_map = compile_to_cuda(
                 self.launcher._ir, constexpr_values=constexpr_values
             )
-            with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
-                f.write(cuda_source)
-                cu_path = f.name
-            so_path = cu_path.replace(".cu", ".so")
+            self.launcher._msl_source = cuda_source
 
-            # Try to compile with nvcc
-            result = subprocess.run(
-                ["nvcc", "-arch=sm_80", "-O2", "-shared", "-Xcompiler", "-fPIC",
-                 "-o", so_path, cu_path],
-                capture_output=True, timeout=60
-            )
-            if result.returncode != 0:
-                os.unlink(cu_path)
-                raise RuntimeError(
-                    f"locomp CUDA backend: nvcc compilation failed.\n"
-                    f"{result.stderr.decode()}\n"
-                    "Make sure nvcc is installed: https://developer.nvidia.com/cuda-downloads"
+            # ── Disk cache: ~/.cache/locomp/cuda/<sha256>.so ──────────────────
+            src_hash = hashlib.sha256(cuda_source.encode()).hexdigest()
+            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "locomp", "cuda")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_so = os.path.join(cache_dir, f"{src_hash}.so")
+
+            if not os.path.exists(cached_so):
+                with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
+                    f.write(cuda_source)
+                    cu_path = f.name
+                tmp_so = cu_path.replace(".cu", ".so")
+                result = subprocess.run(
+                    ["nvcc", "-arch=sm_80", "-O2", "-shared", "-Xcompiler", "-fPIC",
+                     "-o", tmp_so, cu_path],
+                    capture_output=True, timeout=60
                 )
-            os.unlink(cu_path)
+                os.unlink(cu_path)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"locomp CUDA backend: nvcc compilation failed.\n"
+                        f"{result.stderr.decode()}\n"
+                        "Make sure nvcc is installed: https://developer.nvidia.com/cuda-downloads"
+                    )
+                shutil.move(tmp_so, cached_so)
 
-            lib = ctypes.CDLL(so_path)
+            lib = ctypes.CDLL(cached_so)
             launch_fn = getattr(lib, f"locomp_launch_{self.launcher.func_name}")
             launch_fn.argtypes = [
                 ctypes.c_int, ctypes.c_int,   # grid_x, grid_y
@@ -696,8 +705,7 @@ class _KernelCall:
                 ctypes.POINTER(ctypes.c_void_p),
             ]
             launch_fn.restype = None
-            self.launcher._specialized[constexpr_key] = (launch_fn, param_map, cuda_source, so_path)
-            self.launcher._msl_source = cuda_source
+            self.launcher._specialized[constexpr_key] = (launch_fn, param_map, cuda_source, cached_so)
 
         launch_fn, param_map, cuda_source, so_path = self.launcher._specialized[constexpr_key]
 

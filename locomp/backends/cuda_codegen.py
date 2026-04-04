@@ -57,6 +57,31 @@ def _c_type(dtype: IRType) -> str:
 def _math_fn(op: OpCode, dtype: IRType) -> str:
     """Return CUDA math function name for a unary op."""
     use_f = dtype == IRType.FLOAT32
+    use_h = dtype in (IRType.FLOAT16, IRType.BFLOAT16)
+    # float16/bfloat16 use CUDA half-precision intrinsics (hsqrt, hexp, etc.)
+    if use_h:
+        return {
+            OpCode.SQRT:  "hsqrt",
+            OpCode.EXP:   "hexp",
+            OpCode.LOG:   "hlog",
+            OpCode.ABS:   "__habs",
+            OpCode.EXP2:  "hexp2",
+            OpCode.LOG2:  "hlog2",
+            OpCode.CEIL:  "hceil",
+            OpCode.FLOOR: "hfloor",
+            OpCode.ROUND: "hrint",
+            OpCode.RSQRT: "hrsqrt",
+            # No tanh/sin/cos half intrinsics — fall back to float promote
+            OpCode.TANH:  "tanhf",
+            OpCode.SIN:   "sinf",
+            OpCode.COS:   "cosf",
+            OpCode.ASIN:  "asinf",
+            OpCode.ACOS:  "acosf",
+            OpCode.ATAN:  "atanf",
+            OpCode.SINH:  "sinhf",
+            OpCode.COSH:  "coshf",
+            OpCode.LOG10: "log10f",
+        }[op]
     return {
         OpCode.SQRT:  "sqrtf" if use_f else "sqrt",
         OpCode.EXP:   "expf"  if use_f else "exp",
@@ -229,6 +254,13 @@ class CUDACodegen:
                 self._predeclared.add(rid)
 
         if self._predeclared:
+            lines.append("")
+
+        # Emit __shared__ array declarations (must be at top of kernel body)
+        for smem_name, (smem_dtype, smem_size) in self.kernel.shared_mem.items():
+            ct = _c_type(smem_dtype)
+            lines.append(f"{self.indent}__shared__ {ct} {smem_name}[{smem_size}];")
+        if self.kernel.shared_mem:
             lines.append("")
 
         for op in self.kernel.ops:
