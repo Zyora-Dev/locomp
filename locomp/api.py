@@ -368,7 +368,11 @@ class KernelLauncher:
             if platform.system() == "Darwin":
                 return "metal"
             else:
-                return "riscv"  # fallback: generic RISC-V/CPU target
+                # Prefer CUDA if nvidia-smi or nvcc available
+                import shutil
+                if shutil.which("nvcc") or shutil.which("nvidia-smi"):
+                    return "cuda"
+                return "riscv"
         return backend
 
     def _compile(self):
@@ -387,6 +391,8 @@ class KernelLauncher:
             self._msl_source, self._buffer_map = compile_to_metal(self._ir)
         elif self.backend == "riscv":
             self._msl_source, self._buffer_map = compile_to_riscv(self._ir)
+        elif self.backend == "cuda":
+            self._msl_source, self._buffer_map = compile_to_cuda(self._ir)
         else:
             raise NotImplementedError(f"Backend '{self.backend}' not implemented yet")
 
@@ -442,6 +448,8 @@ class _KernelCall:
             return self._launch_metal(*args, **kwargs)
         elif self.launcher.backend == "riscv":
             return self._launch_riscv(*args, **kwargs)
+        elif self.launcher.backend == "cuda":
+            return self._launch_cuda(*args, **kwargs)
         else:
             raise NotImplementedError(f"Backend '{self.launcher.backend}' not implemented")
 
@@ -627,6 +635,107 @@ class _KernelCall:
         c_arr = arr_type(*void_ptrs)
         launch_fn(ctypes.c_int(grid_size),
                   ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p)))
+
+    def _launch_cuda(self, *args, **kwargs):
+        """Launch kernel on NVIDIA GPU using compiled CUDA C (.cu via nvcc)."""
+        import ctypes
+        import os
+        import tempfile
+        import subprocess
+        from locomp.backends.cuda_codegen import compile_to_cuda
+
+        all_args = list(args)
+        for value in kwargs.values():
+            all_args.append(value)
+
+        ir_params = self.launcher._ir.params
+        constexpr_values = {}
+        tensor_args = []
+
+        for i, arg in enumerate(all_args):
+            param = ir_params[i]
+            if param.is_pointer:
+                tensor_args.append(arg)
+            else:
+                if isinstance(arg, float):
+                    constexpr_values[param.name] = float(arg)
+                else:
+                    constexpr_values[param.name] = int(arg)
+
+        constexpr_key = tuple(sorted(constexpr_values.items()))
+
+        if constexpr_key not in self.launcher._specialized:
+            cuda_source, param_map = compile_to_cuda(
+                self.launcher._ir, constexpr_values=constexpr_values
+            )
+            with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
+                f.write(cuda_source)
+                cu_path = f.name
+            so_path = cu_path.replace(".cu", ".so")
+
+            # Try to compile with nvcc
+            result = subprocess.run(
+                ["nvcc", "-arch=sm_80", "-O2", "-shared", "-Xcompiler", "-fPIC",
+                 "-o", so_path, cu_path],
+                capture_output=True, timeout=60
+            )
+            if result.returncode != 0:
+                os.unlink(cu_path)
+                raise RuntimeError(
+                    f"locomp CUDA backend: nvcc compilation failed.\n"
+                    f"{result.stderr.decode()}\n"
+                    "Make sure nvcc is installed: https://developer.nvidia.com/cuda-downloads"
+                )
+            os.unlink(cu_path)
+
+            lib = ctypes.CDLL(so_path)
+            launch_fn = getattr(lib, f"locomp_launch_{self.launcher.func_name}")
+            launch_fn.argtypes = [
+                ctypes.c_int, ctypes.c_int,   # grid_x, grid_y
+                ctypes.c_int, ctypes.c_int,   # block_x, block_y
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            launch_fn.restype = None
+            self.launcher._specialized[constexpr_key] = (launch_fn, param_map, cuda_source, so_path)
+            self.launcher._msl_source = cuda_source
+
+        launch_fn, param_map, cuda_source, so_path = self.launcher._specialized[constexpr_key]
+
+        # Determine grid/block from self.grid and self.threadgroup_size
+        grid_x = self.grid[0] if self.grid else 1
+        grid_y = self.grid[1] if len(self.grid) > 1 else 1
+        block_x = self.threadgroup_size[0] if self.threadgroup_size else 1
+        block_y = self.threadgroup_size[1] if self.threadgroup_size and len(self.threadgroup_size) > 1 else 1
+
+        # Build void** arg array — device pointers for CUDA tensors
+        void_ptrs = []
+        for arg in tensor_args:
+            if hasattr(arg, "_cuda_ptr"):
+                # CUDATensor with device pointer
+                void_ptrs.append(ctypes.c_void_p(arg._cuda_ptr))
+            elif isinstance(arg, np.ndarray):
+                # Auto-allocate device memory, copy, use, then free
+                import ctypes as ct
+                nbytes = arg.nbytes
+                d_ptr = ctypes.c_void_p()
+                _cuda_malloc = ctypes.CDLL("libcuda.so").cuMemAlloc_v2
+                _cuda_malloc(ctypes.byref(d_ptr), nbytes)
+                _cuda_memcpy = ctypes.CDLL("libcuda.so").cuMemcpyHtoD_v2
+                _cuda_memcpy(d_ptr, arg.ctypes.data_as(ctypes.c_void_p), nbytes)
+                void_ptrs.append(d_ptr)
+            elif isinstance(arg, LocompTensor) and arg.data is not None:
+                void_ptrs.append(ctypes.cast(arg.data.ctypes.data_as(ctypes.c_void_p),
+                                             ctypes.c_void_p))
+            else:
+                raise TypeError(f"Unsupported argument type for CUDA backend: {type(arg)}")
+
+        arr_type = (ctypes.c_void_p * len(void_ptrs))
+        c_arr = arr_type(*void_ptrs)
+        launch_fn(
+            ctypes.c_int(grid_x), ctypes.c_int(grid_y),
+            ctypes.c_int(block_x), ctypes.c_int(block_y),
+            ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p))
+        )
 
 
 def kernel(func: Callable = None, *, backend: str = "auto") -> KernelLauncher:
