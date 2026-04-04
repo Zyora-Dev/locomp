@@ -486,6 +486,7 @@ class SmolLM2:
         self.down_buf = locomp.empty(HIDDEN, dtype=np.float16)
         self.scores_buf = locomp.empty(self.max_seq, dtype=np.float16)
         self.logits_buf = locomp.empty(VOCAB, dtype=np.float16)
+        self.token_id_buf = locomp.tensor(np.zeros(1, dtype=np.int32))  # GPU token id buffer
 
     def _rms_norm(self, x, w, out, rows=1):
         rms_norm_kernel[(rows,), (128,)](x, w, out, HIDDEN, int(RMS_EPS * 1000000))
@@ -557,10 +558,11 @@ class SmolLM2:
 
     def forward(self, token_id, pos):
         """Forward pass for a single token at position `pos`. Returns logits numpy array."""
-        # Embedding lookup (CPU for now — single row copy)
-        embed_np = self.w["model.embed_tokens.weight"].numpy()[token_id]
-        # Upload to hidden_buf
-        self.hidden_buf = locomp.tensor(embed_np.astype(np.float16))
+        # GPU embedding lookup — no CPU round-trip
+        self.token_id_buf.data[0] = token_id
+        self.token_id_buf._metal_buffer = None  # force re-upload with new token id
+        locomp.embed_lookup(self.token_id_buf, self.w["model.embed_tokens.weight"],
+                            self.hidden_buf, seq_len=1, dim=HIDDEN)
 
         # Run all layers
         for layer_idx in range(N_LAYERS):
