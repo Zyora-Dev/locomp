@@ -367,10 +367,7 @@ class KernelLauncher:
             if platform.system() == "Darwin":
                 return "metal"
             else:
-                raise RuntimeError(
-                    "No GPU backend available. "
-                    "Apple Metal requires macOS."
-                )
+                return "riscv"  # fallback: generic RISC-V/CPU target
         return backend
 
     def _compile(self):
@@ -384,9 +381,11 @@ class KernelLauncher:
         # Step 2: Optimize IR
         self._ir = optimize(self._ir, target=self.backend)
 
-        # Step 3: IR → MSL source code
+        # Step 3: IR → target source code
         if self.backend == "metal":
             self._msl_source, self._buffer_map = compile_to_metal(self._ir)
+        elif self.backend == "riscv":
+            self._msl_source, self._buffer_map = compile_to_riscv(self._ir)
         else:
             raise NotImplementedError(f"Backend '{self.backend}' not implemented yet")
 
@@ -440,6 +439,8 @@ class _KernelCall:
                             (time.perf_counter() - t0) * 1000)
                 return result
             return self._launch_metal(*args, **kwargs)
+        elif self.launcher.backend == "riscv":
+            return self._launch_riscv(*args, **kwargs)
         else:
             raise NotImplementedError(f"Backend '{self.launcher.backend}' not implemented")
 
@@ -528,6 +529,103 @@ class _KernelCall:
         # Mark tensor args as GPU-dirty
         for t in output_tensors:
             t._mark_dirty()
+
+    def _launch_riscv(self, *args, **kwargs):
+        """Launch kernel on RISC-V / CPU using compiled C + RVV source.
+
+        On the host machine this compiles to native C and runs it via ctypes.
+        On a RISC-V target with GCC + RVV the same source compiles with full
+        vector acceleration (-march=rv64gcv).
+        """
+        import ctypes
+        import os
+        import tempfile
+        import subprocess
+        from locomp.backends.riscv_codegen import compile_to_riscv
+
+        # Collect args
+        all_args = list(args)
+        for value in kwargs.values():
+            all_args.append(value)
+
+        ir_params = self.launcher._ir.params
+        constexpr_values = {}
+        tensor_args = []
+
+        for i, arg in enumerate(all_args):
+            param = ir_params[i]
+            if param.is_pointer:
+                tensor_args.append(arg)
+            else:
+                if isinstance(arg, float):
+                    constexpr_values[param.name] = float(arg)
+                else:
+                    constexpr_values[param.name] = int(arg)
+
+        constexpr_key = tuple(sorted(constexpr_values.items()))
+
+        if constexpr_key not in self.launcher._specialized:
+            c_source, param_map = compile_to_riscv(
+                self.launcher._ir, constexpr_values=constexpr_values
+            )
+            # Write C source to temp file and compile
+            with tempfile.NamedTemporaryFile(suffix=".c", delete=False, mode="w") as f:
+                f.write(c_source)
+                c_path = f.name
+            so_path = c_path.replace(".c", ".so")
+            # Try RVV-capable compiler first, fall back to host cc
+            compilers = ["riscv64-unknown-linux-gnu-gcc", "riscv64-linux-gnu-gcc", "cc", "gcc"]
+            flags_rvv = ["-march=rv64gcv", "-O2", "-shared", "-fPIC", "-lm", "-lpthread"]
+            flags_host = ["-O2", "-shared", "-fPIC", "-lm", "-lpthread"]
+            compiled = False
+            for cc in compilers:
+                flags = flags_rvv if "riscv" in cc else flags_host
+                try:
+                    result = subprocess.run(
+                        [cc] + flags + ["-o", so_path, c_path],
+                        capture_output=True, timeout=30
+                    )
+                    if result.returncode == 0:
+                        compiled = True
+                        break
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+            if not compiled:
+                os.unlink(c_path)
+                raise RuntimeError(
+                    "locomp RISC-V backend: no suitable C compiler found.\n"
+                    "Install riscv64-linux-gnu-gcc for native RVV, or gcc for host simulation.\n"
+                    "  macOS:  brew install riscv-gnu-toolchain\n"
+                    "  Linux:  apt install gcc-riscv64-linux-gnu"
+                )
+            os.unlink(c_path)
+            lib = ctypes.CDLL(so_path)
+            launch_fn = getattr(lib, f"locomp_launch_{self.launcher.func_name}")
+            launch_fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+            launch_fn.restype = None
+            self.launcher._specialized[constexpr_key] = (launch_fn, param_map, c_source, so_path)
+            self.launcher._msl_source = c_source
+
+        launch_fn, param_map, c_source, so_path = self.launcher._specialized[constexpr_key]
+
+        # Build void** arg array for the launch function
+        grid_size = self.grid[0] if self.grid else 1
+        void_ptrs = []
+        for arg in tensor_args:
+            if isinstance(arg, LocompTensor):
+                arr = arg.data if arg.data is not None else np.zeros(arg.size, dtype=arg.dtype)
+                void_ptrs.append(ctypes.cast(arr.ctypes.data_as(ctypes.c_void_p),
+                                             ctypes.c_void_p))
+            elif isinstance(arg, np.ndarray):
+                void_ptrs.append(ctypes.cast(arg.ctypes.data_as(ctypes.c_void_p),
+                                             ctypes.c_void_p))
+            else:
+                raise TypeError(f"Unsupported argument type for RISC-V backend: {type(arg)}")
+
+        arr_type = (ctypes.c_void_p * len(void_ptrs))
+        c_arr = arr_type(*void_ptrs)
+        launch_fn(ctypes.c_int(grid_size),
+                  ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p)))
 
 
 def kernel(func: Callable = None, *, backend: str = "auto") -> KernelLauncher:
