@@ -667,24 +667,46 @@ class _KernelCall:
         constexpr_key = tuple(sorted(constexpr_values.items()))
 
         if constexpr_key not in self.launcher._specialized:
+            import json
+
+            # ── Disk cache: ~/.cache/locomp/cuda/<sha256>.so ──────────────────
+            # Generate source to get hash (fast, Python-only, no nvcc)
             cuda_source, param_map = compile_to_cuda(
                 self.launcher._ir, constexpr_values=constexpr_values
             )
             self.launcher._msl_source = cuda_source
 
-            # ── Disk cache: ~/.cache/locomp/cuda/<sha256>.so ──────────────────
             src_hash = hashlib.sha256(cuda_source.encode()).hexdigest()
             cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "locomp", "cuda")
             os.makedirs(cache_dir, exist_ok=True)
             cached_so = os.path.join(cache_dir, f"{src_hash}.so")
+            cached_meta = os.path.join(cache_dir, f"{src_hash}.json")
 
-            if not os.path.exists(cached_so):
+            if os.path.exists(cached_so) and os.path.exists(cached_meta):
+                # Warm reload: .so already compiled, skip nvcc entirely
+                with open(cached_meta) as f:
+                    param_map = json.load(f)
+            else:
+                # Detect actual GPU SM arch via nvidia-smi
+                sm_arch = "sm_80"  # safe fallback
+                try:
+                    r = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if r.returncode == 0:
+                        cap = r.stdout.strip().split("\n")[0].strip().replace(".", "")
+                        if cap.isdigit():
+                            sm_arch = f"sm_{cap}"
+                except Exception:
+                    pass
+
                 with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
                     f.write(cuda_source)
                     cu_path = f.name
                 tmp_so = cu_path.replace(".cu", ".so")
                 result = subprocess.run(
-                    ["nvcc", "-arch=sm_80", "-O2", "-shared", "-Xcompiler", "-fPIC",
+                    ["nvcc", f"-arch={sm_arch}", "-O2", "-shared", "-Xcompiler", "-fPIC",
                      "-o", tmp_so, cu_path],
                     capture_output=True, timeout=60
                 )
@@ -696,6 +718,8 @@ class _KernelCall:
                         "Make sure nvcc is installed: https://developer.nvidia.com/cuda-downloads"
                     )
                 shutil.move(tmp_so, cached_so)
+                with open(cached_meta, "w") as f:
+                    json.dump(param_map, f)
 
             lib = ctypes.CDLL(cached_so)
             launch_fn = getattr(lib, f"locomp_launch_{self.launcher.func_name}")
