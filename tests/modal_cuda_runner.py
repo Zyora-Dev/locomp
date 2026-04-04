@@ -19,9 +19,11 @@ app = modal.App("locomp-cuda-benchmarks")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git")
     .pip_install("numpy")
-    .copy_local_dir(".", "/locomp_src")
-    .run_commands("pip install /locomp_src")
+    .run_commands(
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@c917d8f'",
+    )
 )
 
 
@@ -47,6 +49,20 @@ def run_cuda_benchmarks():
 
     _so_cache = {}
 
+    # Detect actual GPU SM arch once
+    sm_arch = "sm_80"
+    try:
+        r_smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5)
+        if r_smi.returncode == 0:
+            cap = r_smi.stdout.strip().split("\n")[0].strip().replace(".", "")
+            if cap.isdigit():
+                sm_arch = f"sm_{cap}"
+    except Exception:
+        pass
+    print(f"[info] GPU arch: {sm_arch}", flush=True)
+
     def _build_so(fn, constexpr_values):
         import hashlib, shutil
         ir = compile_kernel(fn)
@@ -59,7 +75,7 @@ def run_cuda_benchmarks():
             f.write(cuda_src); cu = f.name
         so = cu.replace(".cu", ".so")
         r = subprocess.run(
-            ["nvcc", "-arch=sm_86", "-O2", "-w", "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
+            ["nvcc", f"-arch={sm_arch}", "-O2", "-w", "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
             capture_output=True, text=True)
         os.unlink(cu)
         if r.returncode != 0:
@@ -122,44 +138,56 @@ def run_cuda_benchmarks():
             print(f"[ERROR in {name}]\n{tb}", flush=True)
             results.append({"name": name, "status": "ERROR", "error": str(e)})
 
-    # ── 1. vector_add  16M ────────────────────────────────────────────────────
+    # Use 256 threads/block for real GPU occupancy — kernels use block+thread index
+    BS = 256
     N = 16 * 1024 * 1024
+    BLOCKS = N // BS  # 65536 blocks
+
+    # ── 1. vector_add  16M  (256 threads/block) ───────────────────────────────
     def vector_add(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
                    N: locomp.constexpr):
-        i = locomp.program_id(0)
+        bid = locomp.program_id(0)
+        tid = locomp.local_id(0)
+        i = bid * 256 + tid
         locomp.store(Out + i, locomp.load(A + i) + locomp.load(B + i))
     a = np.random.randn(N).astype(np.float32)
     b = np.random.randn(N).astype(np.float32)
-    bench("vector_add (16M f32)", vector_add, {"N": N}, (N,), (1,),
+    bench("vector_add (16M f32)", vector_add, {"N": N}, (BLOCKS,), (BS,),
           [a, b, np.zeros(N, dtype=np.float32)],
           lambda a, b: a + b, 3 * N * 4)
 
     # ── 2. scale_shift  16M ───────────────────────────────────────────────────
     def scale_shift(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
-        i = locomp.program_id(0)
+        bid = locomp.program_id(0)
+        tid = locomp.local_id(0)
+        i = bid * 256 + tid
         locomp.store(Out + i, locomp.load(X + i) * 2.0 + 1.0)
     x = np.random.randn(N).astype(np.float32)
-    bench("scale_shift (16M f32)", scale_shift, {"N": N}, (N,), (1,),
+    bench("scale_shift (16M f32)", scale_shift, {"N": N}, (BLOCKS,), (BS,),
           [x, np.zeros(N, dtype=np.float32)],
           lambda x: x * 2.0 + 1.0, 2 * N * 4)
 
     # ── 3. relu  16M ──────────────────────────────────────────────────────────
     def relu(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
-        i = locomp.program_id(0)
+        bid = locomp.program_id(0)
+        tid = locomp.local_id(0)
+        i = bid * 256 + tid
         x = locomp.load(X + i)
         locomp.store(Out + i, locomp.where(x > 0.0, x, 0.0))
     x = np.random.randn(N).astype(np.float32)
-    bench("relu (16M f32)", relu, {"N": N}, (N,), (1,),
+    bench("relu (16M f32)", relu, {"N": N}, (BLOCKS,), (BS,),
           [x, np.zeros(N, dtype=np.float32)],
           lambda x: np.maximum(x, 0.0), 2 * N * 4)
 
     # ── 4. sqrt_exp  16M ──────────────────────────────────────────────────────
     def sqrt_exp(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
-        i = locomp.program_id(0)
+        bid = locomp.program_id(0)
+        tid = locomp.local_id(0)
+        i = bid * 256 + tid
         x = locomp.load(X + i)
         locomp.store(Out + i, locomp.exp(locomp.sqrt(locomp.abs(x))))
     x = np.random.randn(N).astype(np.float32)
-    bench("sqrt_exp (16M f32)", sqrt_exp, {"N": N}, (N,), (1,),
+    bench("sqrt_exp (16M f32)", sqrt_exp, {"N": N}, (BLOCKS,), (BS,),
           [x, np.zeros(N, dtype=np.float32)],
           lambda x: np.exp(np.sqrt(np.abs(x))), 2 * N * 4)
 
@@ -180,7 +208,6 @@ def run_cuda_benchmarks():
           (2 * M * K + M) * 4)
 
     # ── 6. shared_memory correctness ─────────────────────────────────────────
-    BS = 256
     Ns = BS * 128  # 32768 elements, 128 blocks of 256 threads
     def smem_copy(A: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         """Copy through shared memory: load to smem, barrier, store from smem."""
@@ -198,11 +225,13 @@ def run_cuda_benchmarks():
 
     # ── 7. trig_fused — sin+cos compute throughput ───────────────────────────
     def trig_fused(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
-        i = locomp.program_id(0)
+        bid = locomp.program_id(0)
+        tid = locomp.local_id(0)
+        i = bid * 256 + tid
         x = locomp.load(X + i)
         locomp.store(Out + i, locomp.sin(x) + locomp.cos(x))
     x_trig = np.random.randn(N).astype(np.float32)
-    bench("trig_fused (16M f32)", trig_fused, {"N": N}, (N,), (1,),
+    bench("trig_fused (16M f32)", trig_fused, {"N": N}, (BLOCKS,), (BS,),
           [x_trig, np.zeros(N, dtype=np.float32)],
           lambda x: np.sin(x) + np.cos(x), 2 * N * 4)
 
