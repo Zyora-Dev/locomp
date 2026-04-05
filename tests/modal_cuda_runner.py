@@ -552,11 +552,11 @@ def run_wmma_gemm():
 
         M, N, K = 16, 16, 16
         rng = np.random.default_rng(42)
-        # WMMA fp16 tiles — pass as float32 storage; kernel casts via (const __half*)
-        a_np = rng.standard_normal((M, K)).astype(np.float32)
-        b_np = rng.standard_normal((K, N)).astype(np.float32)
-        c_np = np.zeros((M, N), dtype=np.float32)
-        expected = (a_np @ b_np).astype(np.float32)
+        # WMMA load_matrix_sync reads __half* from device memory — upload as fp16.
+        # Expected is A@B computed from the fp16-rounded values (matches GPU precision).
+        a_np = rng.standard_normal((M, K)).astype(np.float16)
+        b_np = rng.standard_normal((K, N)).astype(np.float16)
+        expected = (a_np.astype(np.float32) @ b_np.astype(np.float32))
 
         so, pmap, src = _build_so(wmma_gemm_16, {"M": M, "N": N, "K": K})
         print(f"[wmma] nvcc compile OK  ({sm_arch})", flush=True)
@@ -604,9 +604,9 @@ def run_wmma_gemm():
                 acc, C + (row * 16) * N + col * 16, N)
 
         rng2 = np.random.default_rng(99)
-        a2   = rng2.standard_normal((TM, TK)).astype(np.float32)
-        b2   = rng2.standard_normal((TK, TN)).astype(np.float32)
-        exp2 = (a2 @ b2).astype(np.float32)
+        a2   = rng2.standard_normal((TM, TK)).astype(np.float16)
+        b2   = rng2.standard_normal((TK, TN)).astype(np.float16)
+        exp2 = (a2.astype(np.float32) @ b2.astype(np.float32))
 
         so2, _, _ = _build_so(wmma_gemm_tiled, {"M": TM, "N": TN, "K": TK})
         print(f"[wmma_tiled] nvcc compile OK  ({sm_arch})", flush=True)

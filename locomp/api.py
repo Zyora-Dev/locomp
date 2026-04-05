@@ -435,6 +435,7 @@ class KernelLauncher:
         elif self.backend == "riscv":
             self._msl_source, self._buffer_map = compile_to_riscv(self._ir)
         elif self.backend == "cuda":
+            from locomp.backends.cuda_codegen import compile_to_cuda
             self._msl_source, self._buffer_map = compile_to_cuda(self._ir)
         else:
             raise NotImplementedError(f"Backend '{self.backend}' not implemented yet")
