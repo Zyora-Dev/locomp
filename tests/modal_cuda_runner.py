@@ -68,8 +68,8 @@ image = (
         find_links="https://download.pytorch.org/whl/cu121",
     )
     .run_commands(
-        # Install locomp from latest commit — includes CUDARuntime (c6ae496)
-        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@c6ae496'",
+        # Install locomp from latest main — __restrict__ + __ldg + nvcc -O3 (f8ac2ae)
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@main'",
     )
 )
 
