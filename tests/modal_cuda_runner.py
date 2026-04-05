@@ -239,7 +239,7 @@ def run_cuda_benchmarks():
     # One warp (32 threads) per 16×16 output tile. Grid = (N/16, M/16).
     # A[M×K] fp16, B[K×N] fp16, C[M×N] fp32
     TM, TN, TK = 1024, 1024, 1024
-    def wmma_matmul(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
+    def wmma_matmul(A: locomp.Float16, B: locomp.Float16, Out: locomp.Tensor,
                     M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
         bx = locomp.program_id(0)   # tile column (N dim)
         by = locomp.program_id(1)   # tile row    (M dim)
