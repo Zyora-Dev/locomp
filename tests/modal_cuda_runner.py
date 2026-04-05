@@ -16,6 +16,42 @@ Benchmarks (A100-80GB / A100-SXM-140GB):
 import modal
 import numpy as np
 
+# Triton kernels must be at module level — Triton's JIT parser reads source AST
+# and needs `tl` in the module global scope, not in an enclosing function.
+try:
+    import triton
+    import triton.language as tl
+
+    BLOCK_T = 1024
+
+    @triton.jit
+    def triton_vector_add(A_ptr, B_ptr, Out_ptr, N, BLOCK: tl.constexpr):
+        pid  = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        tl.store(Out_ptr + offs,
+                 tl.load(A_ptr + offs, mask=mask) + tl.load(B_ptr + offs, mask=mask),
+                 mask=mask)
+
+    @triton.jit
+    def triton_scale_shift(X_ptr, Out_ptr, N, BLOCK: tl.constexpr):
+        pid  = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        tl.store(Out_ptr + offs, tl.load(X_ptr + offs, mask=mask) * 2.0 + 1.0, mask=mask)
+
+    @triton.jit
+    def triton_relu(X_ptr, Out_ptr, N, BLOCK: tl.constexpr):
+        pid  = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        x = tl.load(X_ptr + offs, mask=mask)
+        tl.store(Out_ptr + offs, tl.where(x > 0.0, x, 0.0), mask=mask)
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
 app = modal.App("locomp-cuda-a100")
 
 # ─── image ────────────────────────────────────────────────────────────────────
@@ -253,35 +289,11 @@ def run_cuda_benchmarks():
     # ═══════════════════════════════════════════════════════════════════════════
     triton_results = []
     try:
+        if not _TRITON_AVAILABLE:
+            raise ImportError("triton not available in this environment")
         import torch
-        import triton
-        import triton.language as tl
 
-        BLOCK_T = 1024   # Triton block size
-
-        @triton.jit
-        def triton_vector_add(A_ptr, B_ptr, Out_ptr, N, BLOCK: tl.constexpr):
-            pid  = tl.program_id(0)
-            offs = pid * BLOCK + tl.arange(0, BLOCK)
-            mask = offs < N
-            tl.store(Out_ptr + offs,
-                     tl.load(A_ptr + offs, mask=mask) + tl.load(B_ptr + offs, mask=mask),
-                     mask=mask)
-
-        @triton.jit
-        def triton_scale_shift(X_ptr, Out_ptr, N, BLOCK: tl.constexpr):
-            pid  = tl.program_id(0)
-            offs = pid * BLOCK + tl.arange(0, BLOCK)
-            mask = offs < N
-            tl.store(Out_ptr + offs, tl.load(X_ptr + offs, mask=mask) * 2.0 + 1.0, mask=mask)
-
-        @triton.jit
-        def triton_relu(X_ptr, Out_ptr, N, BLOCK: tl.constexpr):
-            pid  = tl.program_id(0)
-            offs = pid * BLOCK + tl.arange(0, BLOCK)
-            mask = offs < N
-            x = tl.load(X_ptr + offs, mask=mask)
-            tl.store(Out_ptr + offs, tl.where(x > 0.0, x, 0.0), mask=mask)
+        BLOCK_T = 1024
 
         def _triton_bench(name, kernel_fn, torch_inputs, N, bytes_rw, warmup=10, iters=100):
             grid = lambda _: (triton.cdiv(N, BLOCK_T),)
