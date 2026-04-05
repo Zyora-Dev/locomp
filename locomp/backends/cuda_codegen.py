@@ -760,14 +760,16 @@ class CUDACodegen:
                 # which holds for all ARANGE-derived index arrays.
                 if ct == "float" and size % 4 == 0:
                     n4 = size // 4
-                    return [
-                        f"float {rv}[{size}];",
-                        f"{{",
-                        f"    float4* _src4 = (float4*)({pb} + {pi}[0]);",
-                        f"    float4* _dst4 = (float4*){rv};",
-                        f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = __ldg(_src4 + _j);",
-                        f"}}",
-                    ]
+                    # Use .x/.y/.z/.w to keep data in registers — avoids
+                    # unaligned local-memory float4* cast of stack float[].
+                    ls = [f"float {rv}[{size}];",
+                          f"{{ float4* _src4 = (float4*)({pb} + {pi}[0]);"]
+                    ls.append(f"  for (int _j = 0; _j < {n4}; _j++) {{")
+                    ls.append(f"    float4 _v = __ldg(_src4 + _j);")
+                    ls.append(f"    {rv}[_j*4+0]=_v.x; {rv}[_j*4+1]=_v.y;")
+                    ls.append(f"    {rv}[_j*4+2]=_v.z; {rv}[_j*4+3]=_v.w; }}")
+                    ls.append(f"}}")
+                    return ls
                 return [
                     f"{ct} {rv}[{size}];",
                     f"for (int _i = 0; _i < {size}; _i++) {{ {rv}[_i] = __ldg({pb} + {pi}[_i]); }}",
@@ -775,14 +777,14 @@ class CUDACodegen:
             # Non-indexed tiled load (ptr_expr already has embedded offset)
             if ct == "float" and size % 4 == 0:
                 n4 = size // 4
-                return [
-                    f"float {rv}[{size}];",
-                    f"{{",
-                    f"    float4* _src4 = (float4*)({ptr_expr});",
-                    f"    float4* _dst4 = (float4*){rv};",
-                    f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = __ldg(_src4 + _j);",
-                    f"}}",
-                ]
+                ls = [f"float {rv}[{size}];",
+                      f"{{ float4* _src4 = (float4*)({ptr_expr});"]
+                ls.append(f"  for (int _j = 0; _j < {n4}; _j++) {{")
+                ls.append(f"    float4 _v = __ldg(_src4 + _j);")
+                ls.append(f"    {rv}[_j*4+0]=_v.x; {rv}[_j*4+1]=_v.y;")
+                ls.append(f"    {rv}[_j*4+2]=_v.z; {rv}[_j*4+3]=_v.w; }}")
+                ls.append(f"}}")
+                return ls
             return [
                 f"{ct} {rv}[{size}];",
                 f"for (int _i = 0; _i < {size}; _i++) {{ {rv}[_i] = __ldg({ptr_expr} + _i); }}",
@@ -824,26 +826,26 @@ class CUDACodegen:
                 # Indexed tiled store: pb[ pi[_i] ] = val[_i]
                 if ct == "float" and size % 4 == 0:
                     n4 = size // 4
-                    return [
-                        f"{{",
-                        f"    float4* _dst4 = (float4*)({pb} + {pi}[0]);",
-                        f"    float4* _src4 = (float4*){val};",
-                        f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = _src4[_j];",
-                        f"}}",
-                    ]
+                    # make_float4 keeps data in registers — avoids unaligned
+                    # local-memory cast of stack float[] to float4*.
+                    ls = [f"{{ float4* _dst4 = (float4*)({pb} + {pi}[0]);"]
+                    ls.append(f"  for (int _j = 0; _j < {n4}; _j++)")
+                    ls.append(f"    _dst4[_j] = make_float4({val}[_j*4+0],{val}[_j*4+1],"
+                              f"{val}[_j*4+2],{val}[_j*4+3]);")
+                    ls.append(f"}}")
+                    return ls
                 return [
                     f"for (int _i = 0; _i < {size}; _i++) {{ {pb}[{pi}[_i]] = {val}[_i]; }}",
                 ]
             # Non-indexed tiled store (ptr_expr has embedded offset)
             if ct == "float" and size % 4 == 0:
                 n4 = size // 4
-                return [
-                    f"{{",
-                    f"    float4* _dst4 = (float4*)({ptr_expr});",
-                    f"    float4* _src4 = (float4*){val};",
-                    f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = _src4[_j];",
-                    f"}}",
-                ]
+                ls = [f"{{ float4* _dst4 = (float4*)({ptr_expr});"]
+                ls.append(f"  for (int _j = 0; _j < {n4}; _j++)")
+                ls.append(f"    _dst4[_j] = make_float4({val}[_j*4+0],{val}[_j*4+1],"
+                          f"{val}[_j*4+2],{val}[_j*4+3]);")
+                ls.append(f"}}")
+                return ls
             return [
                 f"for (int _i = 0; _i < {size}; _i++) {{ {ptr_expr}[_i] = {val}[_i]; }}",
             ]
