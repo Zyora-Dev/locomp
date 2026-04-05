@@ -246,6 +246,24 @@ class CUDACodegen:
             for o in op.operands:
                 referenced.add(o.id)
 
+        # Pre-identify pointer-arithmetic ADD results: these are emitted as `T*`
+        # by _gen_arith_binop and must NOT be predeclared as plain `T`.
+        # A value is a pointer result if it is a kernel param OR is produced by
+        # PTR_ADD or by ADD(pointer, int).  Fixed-point propagation handles chains.
+        _ptr_result_ids: set[int] = {p.id for p in self.kernel.params}
+        _changed = True
+        while _changed:
+            _changed = False
+            for op in self.kernel.ops:
+                if op.result is None:
+                    continue
+                if op.opcode in (OpCode.PTR_ADD, OpCode.ADD):
+                    if any(o.id in _ptr_result_ids or getattr(o, 'is_pointer', False)
+                           for o in op.operands):
+                        if op.result.id not in _ptr_result_ids:
+                            _ptr_result_ids.add(op.result.id)
+                            _changed = True
+
         for op in self.kernel.ops:
             if op.result is None:
                 continue
@@ -256,6 +274,7 @@ class CUDACodegen:
                     and op.opcode not in (OpCode.FOR_LOOP_START, OpCode.CONSTANT)
                     and not op.result.is_pointer
                     and op.opcode != OpCode.PTR_ADD
+                    and rid not in _ptr_result_ids
                     and not getattr(op.result, 'is_simdgroup_matrix', False)):
                 var = self._vname(op.result)
                 ct = _c_type(op.result.dtype)
@@ -659,20 +678,25 @@ class CUDACodegen:
             role   = op.attrs.get("role", "a")   # "a", "b", or "acc"
             layout = "wmma::row_major" if op.attrs.get("row_major", True) else "wmma::col_major"
             frag_type = self._wmma_fragment_type(op.result.dtype, role=role, layout=layout)
+            # Fragment input tiles always need __half* — cast inline to avoid
+            # both the type-mismatch compile error AND the float/float* redeclaration.
+            input_cast = "(const __half*)" if role in ("a", "b") else ""
             if source == "shared":
                 arr    = self._vname(op.operands[0])
                 offset = self._vname(op.operands[1])
                 stride = self._vname(op.operands[2])
                 lines = [f"wmma::fragment<{frag_type}> {rv};"]
-                lines.append(f"wmma::load_matrix_sync({rv}, {arr} + {offset}, {stride});")
-            else:  # device pointer
-                ptr    = self._vname(op.operands[0])
-                if op.operands[0].id in self._ptr_exprs:
-                    pb, pi, _ = self._ptr_exprs[op.operands[0].id]
-                    ptr = f"({pb} + {pi})"
+                lines.append(f"wmma::load_matrix_sync({rv}, {input_cast}({arr} + {offset}), {stride});")
+            else:  # device pointer — resolve pointer expression inline (no temp variable)
+                ptr_op = op.operands[0]
+                if ptr_op.id in self._ptr_exprs:
+                    pb, pi, _ = self._ptr_exprs[ptr_op.id]
+                    ptr_expr = f"({pb} + {pi})"
+                else:
+                    ptr_expr = self._vname(ptr_op)
                 stride = self._vname(op.operands[1])
                 lines = [f"wmma::fragment<{frag_type}> {rv};"]
-                lines.append(f"wmma::load_matrix_sync({rv}, {ptr}, {stride});")
+                lines.append(f"wmma::load_matrix_sync({rv}, {input_cast}{ptr_expr}, {stride});")
             return lines
 
         elif op.opcode == OpCode.SIMDGROUP_MATRIX_STORE:
@@ -684,13 +708,15 @@ class CUDACodegen:
                 offset = self._vname(op.operands[2])
                 stride = self._vname(op.operands[3])
                 return f"wmma::store_matrix_sync({arr} + {offset}, {mat}, {stride}, {layout});"
-            else:  # device pointer
-                ptr    = self._vname(op.operands[1])
-                if op.operands[1].id in self._ptr_exprs:
-                    pb, pi, _ = self._ptr_exprs[op.operands[1].id]
-                    ptr = f"({pb} + {pi})"
+            else:  # device pointer — resolve inline to avoid float/float* redeclaration
+                ptr_op = op.operands[1]
+                if ptr_op.id in self._ptr_exprs:
+                    pb, pi, _ = self._ptr_exprs[ptr_op.id]
+                    ptr_expr = f"({pb} + {pi})"
+                else:
+                    ptr_expr = self._vname(ptr_op)
                 stride = self._vname(op.operands[2])
-                return f"wmma::store_matrix_sync({ptr}, {mat}, {stride}, {layout});"
+                return f"wmma::store_matrix_sync({ptr_expr}, {mat}, {stride}, {layout});"
 
         elif op.opcode == OpCode.SIMDGROUP_MATRIX_MAC:
             rv  = self._vname(op.result)
