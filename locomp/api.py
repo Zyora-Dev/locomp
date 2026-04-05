@@ -1077,8 +1077,8 @@ def simdgroup_matrix_load(arr, offset, stride):
     """Load 8×8 matrix from shared memory. Only valid inside @kernel."""
     raise RuntimeError("simdgroup_matrix_load() can only be used inside a @locomp.kernel function")
 
-def simdgroup_matrix_load_device(ptr, stride):
-    """Load 8×8 matrix from device memory. Only valid inside @kernel."""
+def simdgroup_matrix_load_device(ptr, stride, role="a"):
+    """Load 8×8/16×16 matrix from device memory. Only valid inside @kernel."""
     raise RuntimeError("simdgroup_matrix_load_device() can only be used inside a @locomp.kernel function")
 
 def simdgroup_matrix_store(mat, arr, offset, stride):
