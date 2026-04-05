@@ -302,12 +302,50 @@ Prompt: "Python is a programming language that"
 |------|--------|--------|
 | Apple M1 | **Passed** | Local bare metal |
 | Apple M4 | **Passed** | GitHub Actions CI (macOS 15) |
+| NVIDIA A10G (sm_86) | **Passed** | Modal cloud GPU |
+| RISC-V RVV (rv64gcv) | **Passed** | GitHub Actions CI (QEMU) |
 
-All 55 tests, 5 example kernels, and SmolLM2-135M inference pass on both M1 and M4.
+All 55 tests, 5 example kernels, and SmolLM2-135M inference pass on M1 and M4.
 
-## Benchmarks vs MLX
+## Benchmarks vs MLX (Apple M1)
 
 Apple M1, float32, median of 10 runs. Ratio < 1.0 = locomp wins.
+
+| Kernel | vs MLX | Speedup |
+|--------|--------|---------|
+| Flash Attention (N=64) | **0.08×** | 12× faster |
+| RoPE | **0.34×** | 2.9× faster |
+| GELU+bias | **0.38×** | 2.6× faster |
+| Reduce sum | **0.68×** | 1.5× faster |
+| Batch norm | **0.69×** | 1.4× faster |
+| SwiGLU | **0.74×** | 1.4× faster |
+| LayerNorm | **0.77×** | 1.3× faster |
+| Multi-head attention | **0.77×** | 1.3× faster |
+| RMSNorm | **0.85×** | 1.2× faster |
+| Simdgroup matmul (128²) | **0.87×** | 1.15× faster |
+| Online softmax | **0.87×** | 1.15× faster |
+| Gather | **0.93×** | 1.1× faster |
+| Cross attention | **0.93×** | 1.1× faster |
+| Avg pool 2D | **0.96×** | Parity |
+| Simdgroup matmul (1024²) | **0.96×** | Parity |
+| Element-wise add | **1.02×** | Parity |
+
+## Benchmarks — CUDA Backend (NVIDIA A10G)
+
+NVIDIA A10G, 16M-element kernels (256 threads/block), 20 warm runs. A10G peak: 600 GB/s memory, 125 TFLOPS fp16.
+
+| Kernel | Status | Max Error | Time | Throughput |
+|--------|--------|-----------|------|-----------|
+| vector_add (16M f32) | ✅ PASS | 0.00 | 0.415ms | **485 GB/s** |
+| scale_shift (16M f32) | ✅ PASS | 0.00 | 0.283ms | **475 GB/s** |
+| relu (16M f32) | ✅ PASS | 0.00 | 0.282ms | **476 GB/s** |
+| sqrt_exp (16M f32) | ✅ PASS | 1.4e-06 | 0.283ms | **475 GB/s** |
+| dot_product (64×1024) | ✅ PASS | 5.3e-05 | 0.026ms | 20 GB/s |
+| shared_memory copy | ✅ PASS | 0.00 | 0.011ms | 24 GB/s |
+| trig_fused (16M f32) | ✅ PASS | 2.4e-07 | 0.284ms | **473 GB/s** |
+| wmma_matmul (1024³ fp16) | ✅ PASS | 4.3e-04 | 0.156ms | **13.79 TFLOPS** |
+
+Memory-bandwidth kernels (vector_add, relu, scale_shift, sqrt_exp, trig_fused) all run at **~480 GB/s** — **81% of A10G peak** (600 GB/s). wmma matmul uses CUDA tensor cores (`wmma::mma_sync`) for fp16 → fp32 accumulation.
 
 | Kernel | vs MLX | Speedup |
 |--------|--------|---------|
