@@ -540,7 +540,7 @@ def run_wmma_gemm():
     # ── Test 1: 16×16×16 single-tile WMMA GEMM ───────────────────────────────
     try:
         # One warp computes one 16×16 output tile: C = A @ B
-        def wmma_gemm_16(A: locomp.Tensor, B: locomp.Tensor, C: locomp.Tensor,
+        def wmma_gemm_16(A: locomp.Float16, B: locomp.Float16, C: locomp.Tensor,
                          M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
             # single warp kernel: warp 0 computes the 16×16 tile
             warp  = locomp.program_id(0)
@@ -588,7 +588,7 @@ def run_wmma_gemm():
         TM, TN = 128, 128
         TK = 64
 
-        def wmma_gemm_tiled(A: locomp.Tensor, B: locomp.Tensor, C: locomp.Tensor,
+        def wmma_gemm_tiled(A: locomp.Float16, B: locomp.Float16, C: locomp.Tensor,
                             M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
             warp = locomp.program_id(0)
             row  = warp // (N // 16)
