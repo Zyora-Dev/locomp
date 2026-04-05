@@ -128,6 +128,7 @@ class CUDACodegen:
         for k, v in raw.items():
             self._constexpr_values[k] = v
         self._ptr_exprs: dict[int, tuple[str, str, bool]] = {}
+        self._ptr_elem_dtype: dict[int, "IRType"] = {}
         self._nesting: int = 0
         self._predeclared: set[int] = set()
 
@@ -225,10 +226,7 @@ class CUDACodegen:
         self._nesting = 0
         self._ptr_exprs = {}
 
-        # Pre-pass: track the element dtype of every pointer-typed IR value.
-        # The IR records all ADD results as FLOAT32, losing Float16/BF16 info.
-        # We recover it by propagating from param dtypes through all pointer ADD chains.
-        self._ptr_elem_dtype: dict[int, IRType] = {}
+        # _ptr_elem_dtype pre-pass (inside _gen_body so it has access to ops)
         for p in self.kernel.params:
             if p.is_pointer:
                 self._ptr_elem_dtype[p.id] = p.dtype
@@ -238,7 +236,7 @@ class CUDACodegen:
             for _op in self.kernel.ops:
                 if _op.result is None:
                     continue
-                if _op.opcode in (OpCode.PTR_ADD, OpCode.ADD):
+                if _op.opcode in (OpCode.PTR_ADD, OpCode.ADD, OpCode.COPY):
                     for _o in _op.operands:
                         if _o.id in self._ptr_elem_dtype:
                             if _op.result.id not in self._ptr_elem_dtype:
@@ -270,7 +268,9 @@ class CUDACodegen:
         # Pre-identify pointer-arithmetic ADD results: these are emitted as `T*`
         # by _gen_arith_binop and must NOT be predeclared as plain `T`.
         # A value is a pointer result if it is a kernel param OR is produced by
-        # PTR_ADD or by ADD(pointer, int).  Fixed-point propagation handles chains.
+        # PTR_ADD / ADD(pointer, int) / COPY(pointer).
+        # COPY is included because the optimizer may replace ADD(ptr, 0) with COPY(ptr).
+        # Fixed-point propagation handles chains.
         _ptr_result_ids: set[int] = {p.id for p in self.kernel.params}
         _changed = True
         while _changed:
@@ -278,7 +278,7 @@ class CUDACodegen:
             for op in self.kernel.ops:
                 if op.result is None:
                     continue
-                if op.opcode in (OpCode.PTR_ADD, OpCode.ADD):
+                if op.opcode in (OpCode.PTR_ADD, OpCode.ADD, OpCode.COPY):
                     if any(o.id in _ptr_result_ids or getattr(o, 'is_pointer', False)
                            for o in op.operands):
                         if op.result.id not in _ptr_result_ids:
@@ -652,6 +652,15 @@ class CUDACodegen:
             a = self._vname(op.operands[0])
             if op.result.aliases is not None:
                 return f"{rv} = {a};"
+            # If operand is a pointer (e.g. optimizer replaced ADD(ptr, 0) with
+            # COPY(ptr)), emit as pointer copy with the correct element type.
+            src_id = op.operands[0].id
+            if src_id in self._ptr_elem_dtype:
+                elem_ct = _c_type(self._ptr_elem_dtype[src_id])
+                self._ptr_elem_dtype[op.result.id] = self._ptr_elem_dtype[src_id]
+                # Don't add to _ptr_exprs — vname(result) gives the named ptr var
+                # which is used directly by _gen_store/_gen_load via *vname syntax.
+                return f"{elem_ct}* {rv} = {a};"
             ct = _c_type(op.result.dtype)
             return f"{ct} {rv} = {a};"
 
