@@ -225,6 +225,27 @@ class CUDACodegen:
         self._nesting = 0
         self._ptr_exprs = {}
 
+        # Pre-pass: track the element dtype of every pointer-typed IR value.
+        # The IR records all ADD results as FLOAT32, losing Float16/BF16 info.
+        # We recover it by propagating from param dtypes through all pointer ADD chains.
+        self._ptr_elem_dtype: dict[int, IRType] = {}
+        for p in self.kernel.params:
+            if p.is_pointer:
+                self._ptr_elem_dtype[p.id] = p.dtype
+        _pe_changed = True
+        while _pe_changed:
+            _pe_changed = False
+            for _op in self.kernel.ops:
+                if _op.result is None:
+                    continue
+                if _op.opcode in (OpCode.PTR_ADD, OpCode.ADD):
+                    for _o in _op.operands:
+                        if _o.id in self._ptr_elem_dtype:
+                            if _op.result.id not in self._ptr_elem_dtype:
+                                self._ptr_elem_dtype[_op.result.id] = self._ptr_elem_dtype[_o.id]
+                                _pe_changed = True
+                            break
+
         # Pre-declare variables defined inside nested scopes (same as riscv backend)
         self._predeclared = set()
         depth = 0
@@ -767,7 +788,10 @@ class CUDACodegen:
     def _gen_load(self, op: IROp) -> str | list[str]:
         rv = self._vname(op.result)
         ptr_val = op.operands[0]
-        ct = _c_type(op.result.dtype)
+        # Use elem dtype from pointer chain — the IR records all loads as FLOAT32
+        # even for Float16 params, so we recover the real type here.
+        _elem_dtype = self._ptr_elem_dtype.get(ptr_val.id, op.result.dtype)
+        ct = _c_type(_elem_dtype)
 
         is_tiled = False
         pb = None
@@ -796,6 +820,30 @@ class CUDACodegen:
                     ls.append(f"    {rv}[_j*4+2]=_v.z; {rv}[_j*4+3]=_v.w; }}")
                     ls.append(f"}}")
                     return ls
+                elif ct == "__half" and size % 8 == 0:
+                    # LDG.128: float4 reinterpret → 8 fp16 per load
+                    n8 = size // 8
+                    ls = [f"__half {rv}[{size}];",
+                          f"{{ float4* _src4 = (float4*)({pb} + {pi}[0]);"]
+                    ls.append(f"  for (int _j = 0; _j < {n8}; _j++) {{")
+                    ls.append(f"    float4 _v = __ldg(_src4 + _j);")
+                    ls.append(f"    __half2* _hp = (__half2*)&_v;")
+                    ls.append(f"    {rv}[_j*8+0]=_hp[0].x; {rv}[_j*8+1]=_hp[0].y;")
+                    ls.append(f"    {rv}[_j*8+2]=_hp[1].x; {rv}[_j*8+3]=_hp[1].y;")
+                    ls.append(f"    {rv}[_j*8+4]=_hp[2].x; {rv}[_j*8+5]=_hp[2].y;")
+                    ls.append(f"    {rv}[_j*8+6]=_hp[3].x; {rv}[_j*8+7]=_hp[3].y; }}")
+                    ls.append(f"}}")
+                    return ls
+                elif ct == "__half" and size % 2 == 0:
+                    # LDG.32: half2 vectorised load → 2 fp16 per load
+                    n2 = size // 2
+                    ls = [f"__half {rv}[{size}];",
+                          f"{{ __half2* _src2 = (__half2*)({pb} + {pi}[0]);"]
+                    ls.append(f"  for (int _j = 0; _j < {n2}; _j++) {{")
+                    ls.append(f"    __half2 _v = __ldg(_src2 + _j);")
+                    ls.append(f"    {rv}[_j*2+0]=_v.x; {rv}[_j*2+1]=_v.y; }}")
+                    ls.append(f"}}")
+                    return ls
                 return [
                     f"{ct} {rv}[{size}];",
                     f"for (int _i = 0; _i < {size}; _i++) {{ {rv}[_i] = __ldg({pb} + {pi}[_i]); }}",
@@ -809,6 +857,28 @@ class CUDACodegen:
                 ls.append(f"    float4 _v = __ldg(_src4 + _j);")
                 ls.append(f"    {rv}[_j*4+0]=_v.x; {rv}[_j*4+1]=_v.y;")
                 ls.append(f"    {rv}[_j*4+2]=_v.z; {rv}[_j*4+3]=_v.w; }}")
+                ls.append(f"}}")
+                return ls
+            elif ct == "__half" and size % 8 == 0:
+                n8 = size // 8
+                ls = [f"__half {rv}[{size}];",
+                      f"{{ float4* _src4 = (float4*)({ptr_expr});"]
+                ls.append(f"  for (int _j = 0; _j < {n8}; _j++) {{")
+                ls.append(f"    float4 _v = __ldg(_src4 + _j);")
+                ls.append(f"    __half2* _hp = (__half2*)&_v;")
+                ls.append(f"    {rv}[_j*8+0]=_hp[0].x; {rv}[_j*8+1]=_hp[0].y;")
+                ls.append(f"    {rv}[_j*8+2]=_hp[1].x; {rv}[_j*8+3]=_hp[1].y;")
+                ls.append(f"    {rv}[_j*8+4]=_hp[2].x; {rv}[_j*8+5]=_hp[2].y;")
+                ls.append(f"    {rv}[_j*8+6]=_hp[3].x; {rv}[_j*8+7]=_hp[3].y; }}")
+                ls.append(f"}}")
+                return ls
+            elif ct == "__half" and size % 2 == 0:
+                n2 = size // 2
+                ls = [f"__half {rv}[{size}];",
+                      f"{{ __half2* _src2 = (__half2*)({ptr_expr});"]
+                ls.append(f"  for (int _j = 0; _j < {n2}; _j++) {{")
+                ls.append(f"    __half2 _v = __ldg(_src2 + _j);")
+                ls.append(f"    {rv}[_j*2+0]=_v.x; {rv}[_j*2+1]=_v.y; }}")
                 ls.append(f"}}")
                 return ls
             return [
@@ -847,7 +917,9 @@ class CUDACodegen:
 
         if val_val.shape:
             size = val_val.shape[0]
-            ct = _c_type(val_val.dtype)
+            # Use elem dtype from pointer chain — matches _gen_load behaviour
+            _store_dtype = self._ptr_elem_dtype.get(ptr_val.id, val_val.dtype)
+            ct = _c_type(_store_dtype)
             if is_tiled and pi is not None:
                 # Indexed tiled store: pb[ pi[_i] ] = val[_i]
                 if ct == "float" and size % 4 == 0:
@@ -860,6 +932,27 @@ class CUDACodegen:
                               f"{val}[_j*4+2],{val}[_j*4+3]);")
                     ls.append(f"}}")
                     return ls
+                elif ct == "__half" and size % 8 == 0:
+                    # STG.128: pack 8 fp16 into float4 for wide store
+                    n8 = size // 8
+                    ls = [f"{{ float4* _dst4 = (float4*)({pb} + {pi}[0]);"]
+                    ls.append(f"  for (int _j = 0; _j < {n8}; _j++) {{")
+                    ls.append(f"    float4 _p;")
+                    ls.append(f"    ((__half2*)&_p)[0]=__halves2half2({val}[_j*8+0],{val}[_j*8+1]);")
+                    ls.append(f"    ((__half2*)&_p)[1]=__halves2half2({val}[_j*8+2],{val}[_j*8+3]);")
+                    ls.append(f"    ((__half2*)&_p)[2]=__halves2half2({val}[_j*8+4],{val}[_j*8+5]);")
+                    ls.append(f"    ((__half2*)&_p)[3]=__halves2half2({val}[_j*8+6],{val}[_j*8+7]);")
+                    ls.append(f"    _dst4[_j] = _p; }}")
+                    ls.append(f"}}")
+                    return ls
+                elif ct == "__half" and size % 2 == 0:
+                    # STG.32: __half2 vectorised store
+                    n2 = size // 2
+                    ls = [f"{{ __half2* _dst2 = (__half2*)({pb} + {pi}[0]);"]
+                    ls.append(f"  for (int _j = 0; _j < {n2}; _j++)")
+                    ls.append(f"    _dst2[_j] = __halves2half2({val}[_j*2+0], {val}[_j*2+1]);")
+                    ls.append(f"}}")
+                    return ls
                 return [
                     f"for (int _i = 0; _i < {size}; _i++) {{ {pb}[{pi}[_i]] = {val}[_i]; }}",
                 ]
@@ -870,6 +963,25 @@ class CUDACodegen:
                 ls.append(f"  for (int _j = 0; _j < {n4}; _j++)")
                 ls.append(f"    _dst4[_j] = make_float4({val}[_j*4+0],{val}[_j*4+1],"
                           f"{val}[_j*4+2],{val}[_j*4+3]);")
+                ls.append(f"}}")
+                return ls
+            elif ct == "__half" and size % 8 == 0:
+                n8 = size // 8
+                ls = [f"{{ float4* _dst4 = (float4*)({ptr_expr});"]
+                ls.append(f"  for (int _j = 0; _j < {n8}; _j++) {{")
+                ls.append(f"    float4 _p;")
+                ls.append(f"    ((__half2*)&_p)[0]=__halves2half2({val}[_j*8+0],{val}[_j*8+1]);")
+                ls.append(f"    ((__half2*)&_p)[1]=__halves2half2({val}[_j*8+2],{val}[_j*8+3]);")
+                ls.append(f"    ((__half2*)&_p)[2]=__halves2half2({val}[_j*8+4],{val}[_j*8+5]);")
+                ls.append(f"    ((__half2*)&_p)[3]=__halves2half2({val}[_j*8+6],{val}[_j*8+7]);")
+                ls.append(f"    _dst4[_j] = _p; }}")
+                ls.append(f"}}")
+                return ls
+            elif ct == "__half" and size % 2 == 0:
+                n2 = size // 2
+                ls = [f"{{ __half2* _dst2 = (__half2*)({ptr_expr});"]
+                ls.append(f"  for (int _j = 0; _j < {n2}; _j++)")
+                ls.append(f"    _dst2[_j] = __halves2half2({val}[_j*2+0], {val}[_j*2+1]);")
                 ls.append(f"}}")
                 return ls
             return [
@@ -909,7 +1021,8 @@ class CUDACodegen:
                 return None
             else:
                 self._ptr_exprs[op.result.id] = (base_expr, idx_var, False)
-                return f"{ct}* {rv} = {base_expr} + {idx_var};"
+                ptr_ct = _c_type(self._ptr_elem_dtype.get(ptr_op.id, op.result.dtype))
+                return f"{ptr_ct}* {rv} = {base_expr} + {idx_var};"
 
         sym = {OpCode.ADD: "+", OpCode.SUB: "-", OpCode.MUL: "*",
                OpCode.DIV: "/", OpCode.MOD: "%"}.get(op.opcode, "+")
