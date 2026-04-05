@@ -26,8 +26,10 @@ image = (
     .apt_install("git")
     .pip_install(
         "numpy",
-        "torch",          # needed by triton benchmarks
-        "triton",         # standalone triton (PyPI v3+)
+        # PyTorch cu121 wheel — compatible with CUDA driver 12.0 (Modal A100)
+        "torch==2.3.1",
+        "triton==2.3.1",
+        find_links="https://download.pytorch.org/whl/cu121",
     )
     .run_commands(
         # Install locomp from latest commit — includes CUDARuntime (c6ae496)
