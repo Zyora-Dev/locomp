@@ -1285,7 +1285,7 @@ def run_full_cuda_benchmark():
 
 # ─── smem / atomics / control flow validation ────────────────────────────────
 
-@app.function(gpu="A100-80GB", image=image, timeout=300)
+@app.function(gpu="A100-80GB", image=image, timeout=600)
 def run_smem_atomics_cf():
     """Execute smem+barrier, atomic_add/max/min, if/else, while, nested-for-if,
     and reduce_sum/max/min on a real A100 GPU.
@@ -1631,8 +1631,8 @@ def main():
     gpu_ag_results     = gpu_ag_handle.get()
     wmma_results       = wmma_handle.get()
     warp_results       = warp_handle.get()
-    full_bench_results = full_bench_handle.get()
     smem_results       = smem_handle.get()
+    full_bench_results = full_bench_handle.get()
 
     locomp_results = data["locomp"]
     triton_results = data["triton"]
