@@ -69,7 +69,7 @@ image = (
     )
     .run_commands(
         # Pinned to exact commit — forces Modal to rebuild image layer
-        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@3b801eb'",
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@ff04afe'",
     )
 )
 
