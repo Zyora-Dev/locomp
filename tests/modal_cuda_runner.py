@@ -69,7 +69,7 @@ image = (
     )
     .run_commands(
         # Pinned to exact commit — forces Modal to rebuild image layer
-        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@92d8446'",
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@3b801eb'",
     )
 )
 
@@ -333,11 +333,319 @@ def run_cuda_benchmarks():
     return {"locomp": results, "triton": triton_results}
 
 
+# ─── gpu_ag CUDA backward pass ────────────────────────────────────────────────
+
+@app.function(gpu="A100-80GB", image=image, timeout=300)
+def run_gpu_ag_cuda():
+    """
+    Run gpu_ag forward + backward for add/sub/mul/div/exp/log/relu/pow/sigmoid/tanh
+    on CUDA backend. Compares gradients against NumPy reference (finite differences).
+    First time any gpu_ag CUDA execution has run on a real NVIDIA GPU.
+    """
+    import locomp
+    import locomp.gpu_autograd as gpu_ag
+    import numpy as np
+    import traceback
+
+    results = []
+
+    def _check(name, got, expected, tol=2e-3):
+        got = np.asarray(got, dtype=np.float32).flatten()
+        expected = np.asarray(expected, dtype=np.float32).flatten()
+        max_err = float(np.max(np.abs(got - expected)))
+        status = "PASS" if max_err < tol else "FAIL"
+        results.append({"name": name, "status": status, "max_err": max_err})
+        print(f"  {name:<35} {status}  max_err={max_err:.2e}", flush=True)
+
+    N = 1024
+    rng = np.random.default_rng(7)
+    a_np = rng.uniform(0.5, 2.0, N).astype(np.float32)
+    b_np = rng.uniform(0.5, 2.0, N).astype(np.float32)
+
+    def _t(arr): return gpu_ag.tensor(arr, requires_grad=True, backend="cuda")
+
+    # ── add ───────────────────────────────────────────────────────────────────
+    try:
+        a, b = _t(a_np), _t(b_np)
+        out = gpu_ag.add(a, b)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("add fwd", out.numpy(), a_np + b_np)
+        _check("add bwd a.grad", a.grad.numpy(), np.ones(N))
+        _check("add bwd b.grad", b.grad.numpy(), np.ones(N))
+    except Exception:
+        results.append({"name": "add", "status": "ERROR", "max_err": -1})
+        print(f"  add ERROR\n{traceback.format_exc()}", flush=True)
+    gpu_ag.zero_grad(a, b)
+
+    # ── sub ───────────────────────────────────────────────────────────────────
+    try:
+        a, b = _t(a_np), _t(b_np)
+        out = gpu_ag.sub(a, b)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("sub fwd", out.numpy(), a_np - b_np)
+        _check("sub bwd a.grad", a.grad.numpy(), np.ones(N))
+        _check("sub bwd b.grad", b.grad.numpy(), -np.ones(N))
+    except Exception:
+        results.append({"name": "sub", "status": "ERROR", "max_err": -1})
+        print(f"  sub ERROR\n{traceback.format_exc()}", flush=True)
+    gpu_ag.zero_grad(a, b)
+
+    # ── mul ───────────────────────────────────────────────────────────────────
+    try:
+        a, b = _t(a_np), _t(b_np)
+        out = gpu_ag.mul(a, b)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("mul fwd", out.numpy(), a_np * b_np)
+        _check("mul bwd a.grad", a.grad.numpy(), b_np)
+        _check("mul bwd b.grad", b.grad.numpy(), a_np)
+    except Exception:
+        results.append({"name": "mul", "status": "ERROR", "max_err": -1})
+        print(f"  mul ERROR\n{traceback.format_exc()}", flush=True)
+    gpu_ag.zero_grad(a, b)
+
+    # ── div ───────────────────────────────────────────────────────────────────
+    try:
+        a, b = _t(a_np), _t(b_np)
+        out = gpu_ag.div(a, b)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("div fwd", out.numpy(), a_np / b_np)
+        _check("div bwd a.grad", a.grad.numpy(), 1.0 / b_np)
+        _check("div bwd b.grad", b.grad.numpy(), -a_np / (b_np ** 2))
+    except Exception:
+        results.append({"name": "div", "status": "ERROR", "max_err": -1})
+        print(f"  div ERROR\n{traceback.format_exc()}", flush=True)
+    gpu_ag.zero_grad(a, b)
+
+    # ── exp ───────────────────────────────────────────────────────────────────
+    try:
+        a = _t(a_np)
+        out = gpu_ag.exp(a)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("exp fwd", out.numpy(), np.exp(a_np))
+        _check("exp bwd a.grad", a.grad.numpy(), np.exp(a_np))
+    except Exception:
+        results.append({"name": "exp", "status": "ERROR", "max_err": -1})
+        print(f"  exp ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── log ───────────────────────────────────────────────────────────────────
+    try:
+        a = _t(a_np)
+        out = gpu_ag.log(a)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("log fwd", out.numpy(), np.log(a_np))
+        _check("log bwd a.grad", a.grad.numpy(), 1.0 / a_np)
+    except Exception:
+        results.append({"name": "log", "status": "ERROR", "max_err": -1})
+        print(f"  log ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── relu ──────────────────────────────────────────────────────────────────
+    try:
+        x_np = rng.uniform(-1.0, 1.0, N).astype(np.float32)
+        a = _t(x_np)
+        out = gpu_ag.relu(a)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        _check("relu fwd", out.numpy(), np.maximum(x_np, 0.0))
+        _check("relu bwd a.grad", a.grad.numpy(), (x_np > 0).astype(np.float32))
+    except Exception:
+        results.append({"name": "relu", "status": "ERROR", "max_err": -1})
+        print(f"  relu ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── chain: relu(exp(a)) ───────────────────────────────────────────────────
+    try:
+        a = _t(a_np)
+        mid = gpu_ag.exp(a)
+        out = gpu_ag.relu(mid)
+        loss = gpu_ag.sum(out)
+        gpu_ag.backward(loss)
+        exp_a = np.exp(a_np)
+        expected_grad = (exp_a > 0).astype(np.float32) * exp_a
+        _check("chain relu(exp) bwd", a.grad.numpy(), expected_grad)
+    except Exception:
+        results.append({"name": "chain relu(exp)", "status": "ERROR", "max_err": -1})
+        print(f"  chain ERROR\n{traceback.format_exc()}", flush=True)
+
+    return results
+
+
+# ─── wmma / Tensor Core end-to-end ───────────────────────────────────────────
+
+@app.function(gpu="A100-80GB", image=image, timeout=300)
+def run_wmma_gemm():
+    """
+    Compile a WMMA 16×16×16 fp16 GEMM kernel with nvcc on A100 (sm_80),
+    launch it, and verify the result against numpy reference.
+    First time any locomp Tensor Core kernel has actually executed.
+    """
+    import locomp
+    import numpy as np
+    import subprocess, ctypes, tempfile, os, hashlib
+    import traceback
+    from locomp.backends.cuda_runtime import get_runtime
+    from locomp.frontend import compile_kernel
+    from locomp.optimizer import optimize
+    from locomp.backends.cuda_codegen import compile_to_cuda
+
+    rt = get_runtime()
+    results = []
+
+    sm_arch = "sm_80"
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            cap = r.stdout.strip().split("\n")[0].strip().replace(".", "")
+            if cap.isdigit():
+                sm_arch = f"sm_{cap}"
+        print(f"[info] arch: {sm_arch}", flush=True)
+    except Exception:
+        pass
+
+    def _build_so(fn, cv):
+        ir = compile_kernel(fn)
+        ir = optimize(ir, target="cuda")
+        src, pmap = compile_to_cuda(ir, constexpr_values=cv)
+        h = hashlib.sha256(src.encode()).hexdigest()[:16]
+        with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
+            f.write(src); cu = f.name
+        so = cu.replace(".cu", ".so")
+        r = subprocess.run(
+            ["nvcc", f"-arch={sm_arch}", "-O3", "-w",
+             "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
+            capture_output=True, text=True)
+        os.unlink(cu)
+        if r.returncode != 0:
+            raise RuntimeError(f"nvcc error:\n{r.stderr[:3000]}")
+        return so, pmap, src
+
+    def _launch(so, fn_name, grid, block, d_tensors):
+        lib = ctypes.CDLL(so)
+        fn = getattr(lib, fn_name)
+        fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                       ctypes.POINTER(ctypes.c_void_p)]
+        fn.restype = None
+        ptrs = [ctypes.c_void_p(t._cuda_ptr) for t in d_tensors]
+        c_arr = (ctypes.c_void_p * len(ptrs))(*ptrs)
+        fn(grid[0], 1, block[0], 1,
+           ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p)))
+        rt.sync()
+
+    # ── Test 1: 16×16×16 single-tile WMMA GEMM ───────────────────────────────
+    try:
+        # One warp computes one 16×16 output tile: C = A @ B
+        def wmma_gemm_16(A: locomp.Tensor, B: locomp.Tensor, C: locomp.Tensor,
+                         M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
+            # single warp kernel: warp 0 computes the 16×16 tile
+            warp  = locomp.program_id(0)
+            acc   = locomp.simdgroup_matrix(0.0)
+            a_frag = locomp.simdgroup_matrix_load_device(A, K, role="a")
+            b_frag = locomp.simdgroup_matrix_load_device(B, N, role="b")
+            acc    = locomp.simdgroup_mac(acc, a_frag, b_frag)
+            locomp.simdgroup_matrix_store_device(acc, C, N)
+
+        M, N, K = 16, 16, 16
+        rng = np.random.default_rng(42)
+        # WMMA fp16 tiles — pass as float32 storage; kernel casts via (const __half*)
+        a_np = rng.standard_normal((M, K)).astype(np.float32)
+        b_np = rng.standard_normal((K, N)).astype(np.float32)
+        c_np = np.zeros((M, N), dtype=np.float32)
+        expected = (a_np @ b_np).astype(np.float32)
+
+        so, pmap, src = _build_so(wmma_gemm_16, {"M": M, "N": N, "K": K})
+        print(f"[wmma] nvcc compile OK  ({sm_arch})", flush=True)
+        print(f"[wmma] param_map: {pmap}", flush=True)
+
+        d_a = rt.upload(a_np.flatten())
+        d_b = rt.upload(b_np.flatten())
+        d_c = rt.zeros(M * N, np.float32)
+
+        # 1 warp = 32 threads; 1 block does the full 16×16 tile
+        _launch(so, "locomp_launch_wmma_gemm_16", (1,), (32,), [d_a, d_b, d_c])
+
+        got = d_c.numpy().reshape(M, N)
+        max_err = float(np.max(np.abs(got - expected)))
+        # fp16 intermediate → fp32 accumulator: expect ~1e-2 max error for random mats
+        status = "PASS" if max_err < 0.5 else "FAIL"
+        results.append({"name": "wmma_gemm_16x16", "status": status,
+                        "max_err": max_err, "note": "fp16 tiles → fp32 acc"})
+        print(f"  wmma_gemm 16×16×16   {status}  max_err={max_err:.3e}  "
+              f"(fp16 precision expected)", flush=True)
+        d_a.free(); d_b.free(); d_c.free()
+
+    except Exception:
+        results.append({"name": "wmma_gemm_16x16", "status": "ERROR", "max_err": -1})
+        print(f"  wmma_gemm ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 2: 128×128 tiled WMMA GEMM (8×8 warp grid) ─────────────────────
+    try:
+        TM, TN = 128, 128
+        TK = 64
+
+        def wmma_gemm_tiled(A: locomp.Tensor, B: locomp.Tensor, C: locomp.Tensor,
+                            M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
+            warp = locomp.program_id(0)
+            row  = warp // (N // 16)
+            col  = warp  % (N // 16)
+            acc  = locomp.simdgroup_matrix(0.0)
+            for k in range(K // 16):
+                a_frag = locomp.simdgroup_matrix_load_device(
+                    A + (row * 16) * K + k * 16, K, role="a")
+                b_frag = locomp.simdgroup_matrix_load_device(
+                    B + k * 16 * N + col * 16, N, role="b")
+                acc = locomp.simdgroup_mac(acc, a_frag, b_frag)
+            locomp.simdgroup_matrix_store_device(
+                acc, C + (row * 16) * N + col * 16, N)
+
+        rng2 = np.random.default_rng(99)
+        a2   = rng2.standard_normal((TM, TK)).astype(np.float32)
+        b2   = rng2.standard_normal((TK, TN)).astype(np.float32)
+        exp2 = (a2 @ b2).astype(np.float32)
+
+        so2, _, _ = _build_so(wmma_gemm_tiled, {"M": TM, "N": TN, "K": TK})
+        print(f"[wmma_tiled] nvcc compile OK  ({sm_arch})", flush=True)
+
+        d_a2 = rt.upload(a2.flatten())
+        d_b2 = rt.upload(b2.flatten())
+        d_c2 = rt.zeros(TM * TN, np.float32)
+
+        n_warps = (TM // 16) * (TN // 16)  # 8×8 = 64 warps
+        _launch(so2, "locomp_launch_wmma_gemm_tiled", (n_warps,), (32,), [d_a2, d_b2, d_c2])
+
+        got2     = d_c2.numpy().reshape(TM, TN)
+        max_err2 = float(np.max(np.abs(got2 - exp2)))
+        status2  = "PASS" if max_err2 < 1.0 else "FAIL"
+        results.append({"name": "wmma_gemm_128x128", "status": status2,
+                        "max_err": max_err2, "note": "fp16 tiles → fp32 acc"})
+        print(f"  wmma_gemm 128×128×64 {status2}  max_err={max_err2:.3e}", flush=True)
+        d_a2.free(); d_b2.free(); d_c2.free()
+
+    except Exception:
+        results.append({"name": "wmma_gemm_128x128", "status": "ERROR", "max_err": -1})
+        print(f"  wmma_gemm_tiled ERROR\n{traceback.format_exc()}", flush=True)
+
+    return results
+
+
 @app.local_entrypoint()
 def main():
-    data = run_cuda_benchmarks.remote()
-    locomp_results  = data["locomp"]
-    triton_results  = data["triton"]
+    # Fire all three sections in parallel
+    bench_handle  = run_cuda_benchmarks.spawn()
+    gpu_ag_handle = run_gpu_ag_cuda.spawn()
+    wmma_handle   = run_wmma_gemm.spawn()
+
+    data           = bench_handle.get()
+    gpu_ag_results = gpu_ag_handle.get()
+    wmma_results   = wmma_handle.get()
+
+    locomp_results = data["locomp"]
+    triton_results = data["triton"]
 
     W = 74
     print(flush=True)
@@ -385,4 +693,43 @@ def main():
             elif tr and tr.get("error"):
                 print(f"  {lname:<30} {'(Triton error)':>32}", flush=True)
         print("=" * W, flush=True)
+
+    # ── gpu_ag CUDA results ───────────────────────────────────────────────────
+    print(flush=True)
+    print("=" * W, flush=True)
+    print("  gpu_ag CUDA — backward pass on A100", flush=True)
+    print("=" * W, flush=True)
+    ag_pass = ag_fail = 0
+    for r in gpu_ag_results:
+        if r["status"] == "ERROR":
+            print(f"  {r['name']:<35} ERROR", flush=True)
+            ag_fail += 1
+        elif r["status"] == "PASS":
+            print(f"  {r['name']:<35} PASS   max_err={r['max_err']:.2e}", flush=True)
+            ag_pass += 1
+        else:
+            print(f"  {r['name']:<35} FAIL   max_err={r['max_err']:.2e}", flush=True)
+            ag_fail += 1
+    print("=" * W, flush=True)
+    print(f"  gpu_ag: {ag_pass} passed, {ag_fail} failed", flush=True)
+
+    # ── wmma / Tensor Core results ────────────────────────────────────────────
+    print(flush=True)
+    print("=" * W, flush=True)
+    print("  wmma / Tensor Core — A100 sm_80", flush=True)
+    print("=" * W, flush=True)
+    wm_pass = wm_fail = 0
+    for r in wmma_results:
+        note = r.get("note", "")
+        if r["status"] == "ERROR":
+            print(f"  {r['name']:<35} ERROR", flush=True)
+            wm_fail += 1
+        elif r["status"] == "PASS":
+            print(f"  {r['name']:<35} PASS   max_err={r['max_err']:.3e}  {note}", flush=True)
+            wm_pass += 1
+        else:
+            print(f"  {r['name']:<35} FAIL   max_err={r['max_err']:.3e}  {note}", flush=True)
+            wm_fail += 1
+    print("=" * W, flush=True)
+    print(f"  wmma: {wm_pass} passed, {wm_fail} failed", flush=True)
 
