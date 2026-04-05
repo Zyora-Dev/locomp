@@ -824,3 +824,50 @@ locomp.Config(grid=lambda M, N, K, **kw: (M//8, N//8, K//4),
 ```
 
 `_dispatch` calls `self.launcher[grid, tg](*full_args)` — `KernelLauncher.__getitem__` handles 1D/2D/3D grid and tg tuples transparently. No changes needed.
+
+---
+
+## Apple Silicon Metal — COMPLETE ✅ (5 April 2026)
+
+All targets for the Apple Silicon Metal backend are achieved. Summary:
+
+### Compiler Pipeline
+| Component | Status |
+|---|---|
+| Python AST → SSA IR (`frontend.py`) | ✅ |
+| Optimizer: const fold, DCE, CSE, strength reduce, type infer | ✅ |
+| Metal codegen: IR → MSL (`metal_codegen.py`) | ✅ |
+| Metal runtime: compile + dispatch via PyObjC + native C bridge | ✅ |
+| All dtypes: float32, float16, bfloat16, int8, int32, uint8, bool | ✅ |
+| All control flow: for, while, if/else, break, continue | ✅ |
+| Shared memory, barrier, atomics, SIMD, simdgroup matrix | ✅ |
+| Constexpr inlining, per-specialization pipeline cache | ✅ |
+
+### Runtime & Tooling
+| Feature | Status |
+|---|---|
+| Native C bridge (`fast_dispatch.dylib`) — async dispatch, no waitUntilCompleted | ✅ |
+| KernelGraph — batch multiple kernels, one command buffer, one sync | ✅ |
+| Autotune (1D/2D/3D grid) + persistent disk cache | ✅ |
+| Profiler — per-kernel wall-clock timing | ✅ |
+| Kernel disk cache (compiled MSL reuse across runs) | ✅ |
+| CI on M4 (macos-15 GitHub Actions runner) | ✅ |
+
+### Kernels (63 examples)
+| Category | Kernels |
+|---|---|
+| Linear algebra | matmul, matvec, tiled matmul, simdgroup matmul, quantized INT4/INT8 |
+| Attention | flash attention v1/v2/v3, simdgroup flash attn, MHA, GQA, MQA, cross attention, causal attn D=64/128 |
+| Normalization | RMSNorm, LayerNorm, batch norm |
+| Activations | GELU, SwiGLU, ReLU, sigmoid, tanh, RoPE |
+| Memory ops | KV cache append, scatter/gather, concat/split, transpose, pooling |
+| Inference | SmolLM2-135M end-to-end (30 layers, GQA, RoPE, INT4) at 7.9 tok/s |
+
+### Autograd
+| Module | Backend | Ops | Tests |
+|---|---|---|---|
+| `locomp.ag` | CPU / NumPy | add, sub, mul, div, matmul, exp, log, relu, pow, sum, mean, sigmoid, tanh, softmax, cross_entropy | 34 |
+| `locomp.gpu_ag` | Metal GPU | add, sub, mul, div, exp, log, relu, pow, sigmoid, tanh, sum, mean, matvec, matmul, softmax, cross_entropy | 50 |
+
+### Test Count
+**209 passed, 9 skipped** — all on Apple M1 locally + M4 in CI.
