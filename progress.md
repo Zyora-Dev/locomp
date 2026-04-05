@@ -807,3 +807,20 @@ print(x.grad.numpy())   # GPU gradient, read back to CPU
 3. `locomp.load(GradOut + 0)` — optimizer folds `ptr + 0` to a non-pointer COPY, codegen emits invalid `float tmp = device_float*` — fixed by replacing with `_bwd_broadcast` scalar constexpr kernel
 
 **Current test count**: 195 passed, 9 skipped
+
+### 2D/3D Grid Autotune ✅ (supported from day 1)
+
+`Config.grid` accepts any callable returning any-dimensional grid tuple. `tg` supports multi-dimensional threadgroup sizes.
+
+```python
+# 2D grid example
+locomp.Config(BLOCK_M=16, BLOCK_N=16,
+              grid=lambda M, N, **kw: (N//16, M//16),
+              tg=(32, 4))
+
+# 3D grid example
+locomp.Config(grid=lambda M, N, K, **kw: (M//8, N//8, K//4),
+              tg=(8, 8, 4))
+```
+
+`_dispatch` calls `self.launcher[grid, tg](*full_args)` — `KernelLauncher.__getitem__` handles 1D/2D/3D grid and tg tuples transparently. No changes needed.
