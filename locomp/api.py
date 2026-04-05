@@ -749,7 +749,7 @@ class _KernelCall:
                     cu_path = f.name
                 tmp_so = cu_path.replace(".cu", ".so")
                 result = subprocess.run(
-                    ["nvcc", f"-arch={sm_arch}", "-O2", "-shared", "-Xcompiler", "-fPIC",
+                    ["nvcc", f"-arch={sm_arch}", "-O3", "-shared", "-Xcompiler", "-fPIC",
                      "-o", tmp_so, cu_path],
                     capture_output=True, timeout=60
                 )

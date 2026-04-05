@@ -206,7 +206,8 @@ class CUDACodegen:
                 continue
             ct = _c_type(p.dtype)
             if p.is_pointer:
-                sig_parts.append(f"{ct}* {base}")
+                # __restrict__ lets nvcc assume no aliasing → enables auto-vec + LDG
+                sig_parts.append(f"{ct}* __restrict__ {base}")
             else:
                 sig_parts.append(f"{ct} {base}")
 
@@ -764,10 +765,11 @@ class CUDACodegen:
             other_val = self._vname(other) if isinstance(other, _IRV) else str(other)
             return [
                 f"{ct} {rv};",
-                f"if ({mask_var}) {{ {rv} = *{ptr_expr}; }}",
+                f"if ({mask_var}) {{ {rv} = __ldg({ptr_expr}); }}",
                 f"else {{ {rv} = ({ct}){other_val}; }}",
             ]
-        return f"{ct} {rv} = *{ptr_expr};"
+        # __ldg: L1 read-only cache (non-coherent load) — optimal for streaming reads
+        return f"{ct} {rv} = __ldg({ptr_expr});"
 
     def _gen_store(self, op: IROp) -> str | list[str]:
         ptr_val = op.operands[0]
