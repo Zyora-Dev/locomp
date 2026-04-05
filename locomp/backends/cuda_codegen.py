@@ -743,6 +743,9 @@ class CUDACodegen:
         ptr_val = op.operands[0]
         ct = _c_type(op.result.dtype)
 
+        is_tiled = False
+        pb = None
+        pi = None
         if ptr_val.id in self._ptr_exprs:
             pb, pi, is_tiled = self._ptr_exprs[ptr_val.id]
             ptr_expr = pb if is_tiled else f"({pb} + {pi})"
@@ -750,11 +753,39 @@ class CUDACodegen:
             ptr_expr = self._vname(ptr_val)
 
         if op.result.shape:
-            # Tiled load — materialise array with loop
             size = op.result.shape[0]
+            if is_tiled and pi is not None:
+                # Indexed tiled load: rv[_i] = pb[ pi[_i] ]
+                # float4 path: assume pi is a linear index (pi[_i] = pi[0] + _i)
+                # which holds for all ARANGE-derived index arrays.
+                if ct == "float" and size % 4 == 0:
+                    n4 = size // 4
+                    return [
+                        f"float {rv}[{size}];",
+                        f"{{",
+                        f"    float4* _src4 = (float4*)({pb} + {pi}[0]);",
+                        f"    float4* _dst4 = (float4*){rv};",
+                        f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = __ldg(_src4 + _j);",
+                        f"}}",
+                    ]
+                return [
+                    f"{ct} {rv}[{size}];",
+                    f"for (int _i = 0; _i < {size}; _i++) {{ {rv}[_i] = __ldg({pb} + {pi}[_i]); }}",
+                ]
+            # Non-indexed tiled load (ptr_expr already has embedded offset)
+            if ct == "float" and size % 4 == 0:
+                n4 = size // 4
+                return [
+                    f"float {rv}[{size}];",
+                    f"{{",
+                    f"    float4* _src4 = (float4*)({ptr_expr});",
+                    f"    float4* _dst4 = (float4*){rv};",
+                    f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = __ldg(_src4 + _j);",
+                    f"}}",
+                ]
             return [
                 f"{ct} {rv}[{size}];",
-                f"for (int _i = 0; _i < {size}; _i++) {{ {rv}[_i] = {ptr_expr}[_i]; }}",
+                f"for (int _i = 0; _i < {size}; _i++) {{ {rv}[_i] = __ldg({ptr_expr} + _i); }}",
             ]
 
         mask = op.attrs.get("mask")
@@ -775,6 +806,9 @@ class CUDACodegen:
         ptr_val = op.operands[0]
         val_val = op.operands[1]
 
+        is_tiled = False
+        pb = None
+        pi = None
         if ptr_val.id in self._ptr_exprs:
             pb, pi, is_tiled = self._ptr_exprs[ptr_val.id]
             ptr_expr = pb if is_tiled else f"({pb} + {pi})"
@@ -785,6 +819,31 @@ class CUDACodegen:
 
         if val_val.shape:
             size = val_val.shape[0]
+            ct = _c_type(val_val.dtype)
+            if is_tiled and pi is not None:
+                # Indexed tiled store: pb[ pi[_i] ] = val[_i]
+                if ct == "float" and size % 4 == 0:
+                    n4 = size // 4
+                    return [
+                        f"{{",
+                        f"    float4* _dst4 = (float4*)({pb} + {pi}[0]);",
+                        f"    float4* _src4 = (float4*){val};",
+                        f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = _src4[_j];",
+                        f"}}",
+                    ]
+                return [
+                    f"for (int _i = 0; _i < {size}; _i++) {{ {pb}[{pi}[_i]] = {val}[_i]; }}",
+                ]
+            # Non-indexed tiled store (ptr_expr has embedded offset)
+            if ct == "float" and size % 4 == 0:
+                n4 = size // 4
+                return [
+                    f"{{",
+                    f"    float4* _dst4 = (float4*)({ptr_expr});",
+                    f"    float4* _src4 = (float4*){val};",
+                    f"    for (int _j = 0; _j < {n4}; _j++) _dst4[_j] = _src4[_j];",
+                    f"}}",
+                ]
             return [
                 f"for (int _i = 0; _i < {size}; _i++) {{ {ptr_expr}[_i] = {val}[_i]; }}",
             ]
