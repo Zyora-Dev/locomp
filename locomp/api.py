@@ -320,32 +320,75 @@ class LocompTensor:
         self._freed = True
 
 
-def tensor(data, dtype=np.float32) -> LocompTensor:
-    """Create a Locust tensor from a list or numpy array."""
-    if isinstance(data, np.ndarray):
-        return LocompTensor(data)
-    return LocompTensor(np.array(data, dtype=dtype))
+def tensor(data, dtype=np.float32, backend: str = "auto"):
+    """Create a locomp tensor from a list or numpy array.
+
+    Args:
+        data:    list, numpy array, or scalar
+        dtype:   numpy dtype (default float32)
+        backend: "auto" | "metal" | "cuda" | "cpu"
+                 "auto" → cuda if CUDA available, else metal/cpu
+    """
+    arr = np.asarray(data, dtype=dtype) if not isinstance(data, np.ndarray) else data
+    if _use_cuda(backend):
+        from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
+        return _get_cuda_rt().upload(arr)
+    return LocompTensor(arr)
 
 
-def empty(shape, dtype=np.float32) -> LocompTensor:
-    """Create an empty Locust tensor."""
+def empty(shape, dtype=np.float32, backend: str = "auto"):
+    """Create an empty locomp tensor."""
     if isinstance(shape, int):
         shape = (shape,)
+    if _use_cuda(backend):
+        from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
+        rt = _get_cuda_rt()
+        size = 1
+        for s in shape:
+            size *= s
+        t = rt.empty(size, dtype)
+        t._shape = tuple(shape)
+        return t
     return LocompTensor(np.empty(shape, dtype=dtype))
 
 
-def zeros(shape, dtype=np.float32) -> LocompTensor:
-    """Create a zero-filled Locust tensor."""
+def zeros(shape, dtype=np.float32, backend: str = "auto"):
+    """Create a zero-filled locomp tensor."""
     if isinstance(shape, int):
         shape = (shape,)
+    if _use_cuda(backend):
+        from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
+        rt = _get_cuda_rt()
+        size = 1
+        for s in shape:
+            size *= s
+        t = rt.zeros(size, dtype)
+        t._shape = tuple(shape)
+        return t
     return LocompTensor(np.zeros(shape, dtype=dtype))
 
 
-def ones(shape, dtype=np.float32) -> LocompTensor:
-    """Create a ones-filled Locust tensor."""
+def ones(shape, dtype=np.float32, backend: str = "auto"):
+    """Create a ones-filled locomp tensor."""
     if isinstance(shape, int):
         shape = (shape,)
+    if _use_cuda(backend):
+        from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
+        return _get_cuda_rt().upload(np.ones(shape, dtype=dtype))
     return LocompTensor(np.ones(shape, dtype=dtype))
+
+
+def _use_cuda(backend: str) -> bool:
+    """Return True if CUDA device should be used for this backend setting."""
+    if backend == "cuda":
+        return True
+    if backend in ("metal", "cpu", "riscv"):
+        return False
+    # "auto": use CUDA only on non-macOS if nvcc is available
+    if platform.system() == "Darwin":
+        return False
+    import shutil
+    return bool(shutil.which("nvcc") or shutil.which("nvidia-smi"))
 
 
 class KernelLauncher:
@@ -740,24 +783,24 @@ class _KernelCall:
         block_y = self.threadgroup_size[1] if self.threadgroup_size and len(self.threadgroup_size) > 1 else 1
 
         # Build void** arg array — device pointers for CUDA tensors
+        from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt, CUDATensor as _CUDATensor
+        _cuda_rt = _get_cuda_rt()
+        _tmp_uploads = []  # CUDATensors auto-uploaded for this launch (freed after call)
         void_ptrs = []
         for arg in tensor_args:
-            if hasattr(arg, "_cuda_ptr"):
-                # CUDATensor with device pointer
+            if isinstance(arg, _CUDATensor):
+                # Already on device
                 void_ptrs.append(ctypes.c_void_p(arg._cuda_ptr))
             elif isinstance(arg, np.ndarray):
-                # Auto-allocate device memory, copy, use, then free
-                import ctypes as ct
-                nbytes = arg.nbytes
-                d_ptr = ctypes.c_void_p()
-                _cuda_malloc = ctypes.CDLL("libcuda.so").cuMemAlloc_v2
-                _cuda_malloc(ctypes.byref(d_ptr), nbytes)
-                _cuda_memcpy = ctypes.CDLL("libcuda.so").cuMemcpyHtoD_v2
-                _cuda_memcpy(d_ptr, arg.ctypes.data_as(ctypes.c_void_p), nbytes)
-                void_ptrs.append(d_ptr)
+                # Upload to device, track for cleanup after launch
+                ct = _cuda_rt.upload(arg)
+                _tmp_uploads.append(ct)
+                void_ptrs.append(ctypes.c_void_p(ct._cuda_ptr))
             elif isinstance(arg, LocompTensor) and arg.data is not None:
-                void_ptrs.append(ctypes.cast(arg.data.ctypes.data_as(ctypes.c_void_p),
-                                             ctypes.c_void_p))
+                # Upload LocompTensor's host data to device
+                ct = _cuda_rt.upload(arg.data)
+                _tmp_uploads.append(ct)
+                void_ptrs.append(ctypes.c_void_p(ct._cuda_ptr))
             else:
                 raise TypeError(f"Unsupported argument type for CUDA backend: {type(arg)}")
 
@@ -768,6 +811,10 @@ class _KernelCall:
             ctypes.c_int(block_x), ctypes.c_int(block_y),
             ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p))
         )
+        _cuda_rt.sync()
+        # Free any tensors we auto-uploaded for this call
+        for _ct in _tmp_uploads:
+            _ct.free()
 
 
 def kernel(func: Callable = None, *, backend: str = "auto") -> KernelLauncher:

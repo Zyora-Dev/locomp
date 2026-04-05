@@ -10,6 +10,7 @@ from locomp.graph import graph, KernelGraph
 from locomp.profiler import profile, Profiler, ProfileResult
 from locomp import autograd as ag
 from locomp import gpu_autograd as gpu_ag
+from locomp.backends.cuda_runtime import CUDATensor, is_available as cuda_available
 from locomp.api import (
     kernel,
     program_id,
@@ -183,4 +184,6 @@ __all__ = [
     "Int8",
     "Int32",
     "Bool",
+    "CUDATensor",
+    "cuda_available",
 ]
