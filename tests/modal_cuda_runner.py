@@ -1283,20 +1283,340 @@ def run_full_cuda_benchmark():
 
 
 
+# ─── smem / atomics / control flow validation ────────────────────────────────
+
+@app.function(gpu="A100-80GB", image=image, timeout=300)
+def run_smem_atomics_cf():
+    """Execute smem+barrier, atomic_add/max/min, if/else, while, nested-for-if,
+    and reduce_sum/max/min on a real A100 GPU.
+    Closes the last verified gap: these patterns were previously codegen
+    string-checked only and had never compiled or run on NVIDIA hardware."""
+    import locomp
+    import numpy as np
+    import traceback
+    import subprocess
+    import ctypes
+    import tempfile
+    import os
+    import hashlib
+    from locomp.frontend import compile_kernel
+    from locomp.optimizer import optimize
+    from locomp.backends.cuda_codegen import compile_to_cuda
+    from locomp.backends.cuda_runtime import get_runtime
+
+    rt = get_runtime()
+    sm_arch = "sm_80"
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            cap = r.stdout.strip().split("\n")[0].strip().replace(".", "")
+            if cap.isdigit():
+                sm_arch = f"sm_{cap}"
+    except Exception:
+        pass
+
+    _so_cache: dict = {}
+
+    def _build_so(fn, constexpr_values: dict = {}):
+        ir = compile_kernel(fn)
+        ir = optimize(ir, target="cuda")
+        cuda_src, param_map = compile_to_cuda(ir, constexpr_values=constexpr_values)
+        key = hashlib.sha256(cuda_src.encode()).hexdigest()
+        if key in _so_cache:
+            return _so_cache[key]
+        with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
+            f.write(cuda_src)
+            cu_path = f.name
+        so_path = cu_path.replace(".cu", ".so")
+        res = subprocess.run(
+            ["nvcc", "-O3", f"-arch={sm_arch}", "--shared", "--compiler-options",
+             "-fPIC", "-o", so_path, cu_path],
+            capture_output=True)
+        os.unlink(cu_path)
+        if res.returncode != 0:
+            print(f"[nvcc STDERR]\n{res.stderr.decode()}", flush=True)
+            raise subprocess.CalledProcessError(res.returncode, res.args, res.stderr)
+        so = ctypes.CDLL(so_path)
+        _so_cache[key] = (so, param_map)
+        return so, param_map
+
+    def _launch(so, fn_name, grid, block, args):
+        launch_fn = getattr(so, fn_name)
+        launch_fn.restype = None
+        launch_fn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_void_p]
+        ptrs = (ctypes.c_void_p * len(args))(*[a._cuda_ptr for a in args])
+        launch_fn(grid[0], grid[1] if len(grid) > 1 else 1,
+                  block[0], block[1] if len(block) > 1 else 1,
+                  ptrs)
+        rt.sync()
+
+    results = []
+
+    def chk(name, got, expected, tol=1e-3):
+        err = float(np.max(np.abs(np.asarray(got, np.float32) -
+                                  np.asarray(expected, np.float32))))
+        status = "PASS" if err <= tol else "FAIL"
+        results.append({"name": name, "status": status, "err": err})
+        print(f"  {name:<40} {status}  err={err:.2e}  got={got}  exp={expected}",
+              flush=True)
+
+    # ── Test 1: shared memory + barrier (reverse via smem) ───────────────────
+    # 1 block of 32 threads.  tid writes float(tid) to smem[tid], barrier,
+    # then reads smem[31-tid].  Expected: O[i] = 31 - i  (exact int values).
+    try:
+        @locomp.kernel
+        def smem_reverse_k(O: locomp.Tensor):
+            smem = locomp.shared_memory(32, locomp.float32)
+            tid  = locomp.local_id(0)
+            locomp.shared_store(smem, tid, locomp.cast(tid, "float32"))
+            locomp.barrier()
+            locomp.store(O + tid, locomp.shared_load(smem, 31 - tid))
+
+        d_out = rt.upload(np.zeros(32, dtype=np.float32))
+        so, _ = _build_so(smem_reverse_k.func)
+        _launch(so, "locomp_launch_smem_reverse_k", (1,), (32,), [d_out])
+        got = d_out.numpy()
+        expected = np.array([31 - i for i in range(32)], dtype=np.float32)
+        err = float(np.max(np.abs(got - expected)))
+        status = "PASS" if err < 1e-3 else "FAIL"
+        results.append({"name": "smem_barrier_reverse", "status": status, "err": err})
+        print(f"  {'smem_barrier_reverse':<40} {status}  err={err:.2e}", flush=True)
+        d_out.free()
+    except Exception:
+        results.append({"name": "smem_barrier_reverse", "status": "ERROR"})
+        print(f"  smem_barrier_reverse   ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 2: atomic_add ────────────────────────────────────────────────────
+    # 1024 threads each add 1.0 to OUT[0].  Expected: 1024.0
+    try:
+        @locomp.kernel
+        def atomic_add_k(OUT: locomp.Tensor):
+            locomp.atomic_add(OUT, 1.0)
+
+        N_threads = 1024
+        d_out = rt.upload(np.zeros(1, dtype=np.float32))
+        so, _ = _build_so(atomic_add_k.func)
+        _launch(so, "locomp_launch_atomic_add_k", (1,), (N_threads,), [d_out])
+        chk("atomic_add (1024 threads → 1024.0)", d_out.numpy()[0], float(N_threads))
+        d_out.free()
+    except Exception:
+        results.append({"name": "atomic_add", "status": "ERROR"})
+        print(f"  atomic_add             ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 3: atomic_max (float, CAS loop) ─────────────────────────────────
+    # 1024 threads, tid writes float(tid).  Max = 1023.0
+    try:
+        @locomp.kernel
+        def atomic_max_k(OUT: locomp.Tensor):
+            tid = locomp.local_id(0)
+            locomp.atomic_max(OUT, locomp.cast(tid, "float32"))
+
+        N_threads = 1024
+        d_out = rt.upload(np.array([-1e9], dtype=np.float32))
+        so, _ = _build_so(atomic_max_k.func)
+        _launch(so, "locomp_launch_atomic_max_k", (1,), (N_threads,), [d_out])
+        chk("atomic_max_f32 (1024 tids → 1023.0)", d_out.numpy()[0], 1023.0)
+        d_out.free()
+    except Exception:
+        results.append({"name": "atomic_max", "status": "ERROR"})
+        print(f"  atomic_max             ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 4: atomic_min (float, CAS loop) ─────────────────────────────────
+    # 1024 threads, tid writes float(tid+1).  Min = 1.0
+    try:
+        @locomp.kernel
+        def atomic_min_k(OUT: locomp.Tensor):
+            tid = locomp.local_id(0)
+            locomp.atomic_min(OUT, locomp.cast(tid + 1, "float32"))
+
+        N_threads = 1024
+        d_out = rt.upload(np.array([1e9], dtype=np.float32))
+        so, _ = _build_so(atomic_min_k.func)
+        _launch(so, "locomp_launch_atomic_min_k", (1,), (N_threads,), [d_out])
+        chk("atomic_min_f32 (1024 tids → 1.0)", d_out.numpy()[0], 1.0)
+        d_out.free()
+    except Exception:
+        results.append({"name": "atomic_min", "status": "ERROR"})
+        print(f"  atomic_min             ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 5: if/else control flow ─────────────────────────────────────────
+    # Compute abs(x) via if/else.  Expected: np.abs(data)
+    try:
+        @locomp.kernel
+        def abs_ifelse_k(X: locomp.Tensor, O: locomp.Tensor, N: locomp.constexpr):
+            i = locomp.program_id(0)
+            x = locomp.load(X + i)
+            if x > 0.0:
+                locomp.store(O + i, x)
+            else:
+                locomp.store(O + i, -x)
+
+        N = 1024
+        rng = np.random.default_rng(7)
+        data = rng.uniform(-1.0, 1.0, N).astype(np.float32)
+        d_x   = rt.upload(data)
+        d_out = rt.upload(np.zeros(N, dtype=np.float32))
+        so, _ = _build_so(abs_ifelse_k.func, {"N": N})
+        _launch(so, "locomp_launch_abs_ifelse_k", (N,), (1,), [d_x, d_out])
+        err = float(np.max(np.abs(d_out.numpy() - np.abs(data))))
+        status = "PASS" if err < 1e-5 else "FAIL"
+        results.append({"name": "if_else_abs", "status": status, "err": err})
+        print(f"  {'if_else_abs (N=1024)':<40} {status}  err={err:.2e}", flush=True)
+        d_x.free(); d_out.free()
+    except Exception:
+        results.append({"name": "if_else_abs", "status": "ERROR"})
+        print(f"  if_else_abs            ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 6: while loop ────────────────────────────────────────────────────
+    # Each thread sums W=10 elements from its row.  Expected: row sums.
+    try:
+        @locomp.kernel
+        def row_sum_while_k(X: locomp.Tensor, O: locomp.Tensor, W: locomp.constexpr):
+            row = locomp.program_id(0)
+            i   = 0
+            acc = 0.0
+            while i < W:
+                acc = acc + locomp.load(X + row * W + i)
+                i   = i + 1
+            locomp.store(O + row, acc)
+
+        ROWS, W = 256, 10
+        data2 = rng.standard_normal(ROWS * W).astype(np.float32)
+        expected2 = data2.reshape(ROWS, W).sum(axis=1)
+        d_x   = rt.upload(data2)
+        d_out = rt.upload(np.zeros(ROWS, dtype=np.float32))
+        so, _ = _build_so(row_sum_while_k.func, {"W": W})
+        _launch(so, "locomp_launch_row_sum_while_k", (ROWS,), (1,), [d_x, d_out])
+        err = float(np.max(np.abs(d_out.numpy() - expected2)))
+        status = "PASS" if err < 1e-3 else "FAIL"
+        results.append({"name": "while_loop_row_sum", "status": status, "err": err})
+        print(f"  {'while_loop_row_sum (256×10)':<40} {status}  err={err:.2e}", flush=True)
+        d_x.free(); d_out.free()
+    except Exception:
+        results.append({"name": "while_loop_row_sum", "status": "ERROR"})
+        print(f"  while_loop_row_sum     ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 7: nested if inside for ─────────────────────────────────────────
+    # For each row: accumulate abs(v) via for + if/else.  Expected: np.abs(row).sum()
+    try:
+        @locomp.kernel
+        def nested_if_for_k(X: locomp.Tensor, O: locomp.Tensor,
+                             ROWS: locomp.constexpr, N: locomp.constexpr):
+            row = locomp.program_id(0)
+            acc = 0.0
+            for j in range(N):
+                v = locomp.load(X + row * N + j)
+                if v > 0.0:
+                    acc = acc + v
+                else:
+                    acc = acc - v
+            locomp.store(O + row, acc)
+
+        ROWS2, N2 = 128, 16
+        data3 = rng.standard_normal(ROWS2 * N2).astype(np.float32)
+        exp3  = np.abs(data3.reshape(ROWS2, N2)).sum(axis=1)
+        d_x   = rt.upload(data3)
+        d_out = rt.upload(np.zeros(ROWS2, dtype=np.float32))
+        so, _ = _build_so(nested_if_for_k.func, {"ROWS": ROWS2, "N": N2})
+        _launch(so, "locomp_launch_nested_if_for_k", (ROWS2,), (1,), [d_x, d_out])
+        err = float(np.max(np.abs(d_out.numpy() - exp3)))
+        status = "PASS" if err < 1e-3 else "FAIL"
+        results.append({"name": "nested_if_for", "status": status, "err": err})
+        print(f"  {'nested_if_for (128×16 abs sum)':<40} {status}  err={err:.2e}", flush=True)
+        d_x.free(); d_out.free()
+    except Exception:
+        results.append({"name": "nested_if_for", "status": "ERROR"})
+        print(f"  nested_if_for          ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 8: reduce_sum (warp shuffle + atomicAdd) ─────────────────────────
+    # 1024 threads, val = float(tid+1).  Expected sum = 1024*1025/2 = 524800.0
+    try:
+        @locomp.kernel
+        def reduce_sum_k(X: locomp.Tensor, OUT: locomp.Tensor, N: locomp.constexpr):
+            i = locomp.program_id(0)
+            val = locomp.load(X + i)
+            locomp.reduce_sum(val, OUT)
+
+        N_rs = 1024
+        data_rs = np.arange(1, N_rs + 1, dtype=np.float32)
+        expected_rs = float(data_rs.sum())
+        d_x   = rt.upload(data_rs)
+        d_out = rt.upload(np.zeros(1, dtype=np.float32))
+        so, _ = _build_so(reduce_sum_k.func, {"N": N_rs})
+        _launch(so, "locomp_launch_reduce_sum_k", (N_rs,), (1,), [d_x, d_out])
+        chk(f"reduce_sum (N=1024 → {expected_rs:.0f})", d_out.numpy()[0], expected_rs,
+            tol=1.0)
+        d_x.free(); d_out.free()
+    except Exception:
+        results.append({"name": "reduce_sum", "status": "ERROR"})
+        print(f"  reduce_sum             ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 9: reduce_max (warp shuffle + float CAS) ─────────────────────────
+    # 1024 threads, val = float(tid+1).  Expected max = 1024.0
+    try:
+        @locomp.kernel
+        def reduce_max_k(X: locomp.Tensor, OUT: locomp.Tensor, N: locomp.constexpr):
+            i = locomp.program_id(0)
+            val = locomp.load(X + i)
+            locomp.reduce_max(val, OUT)
+
+        N_rm = 1024
+        data_rm = np.arange(1, N_rm + 1, dtype=np.float32)
+        d_x   = rt.upload(data_rm)
+        d_out = rt.upload(np.array([-1e9], dtype=np.float32))
+        so, _ = _build_so(reduce_max_k.func, {"N": N_rm})
+        _launch(so, "locomp_launch_reduce_max_k", (N_rm,), (1,), [d_x, d_out])
+        chk("reduce_max (N=1024 → 1024.0)", d_out.numpy()[0], 1024.0)
+        d_x.free(); d_out.free()
+    except Exception:
+        results.append({"name": "reduce_max", "status": "ERROR"})
+        print(f"  reduce_max             ERROR\n{traceback.format_exc()}", flush=True)
+
+    # ── Test 10: reduce_min (warp shuffle + float CAS) ────────────────────────
+    # 1024 threads, val = float(tid+1).  Expected min = 1.0
+    try:
+        @locomp.kernel
+        def reduce_min_k(X: locomp.Tensor, OUT: locomp.Tensor, N: locomp.constexpr):
+            i = locomp.program_id(0)
+            val = locomp.load(X + i)
+            locomp.reduce_min(val, OUT)
+
+        N_rn = 1024
+        data_rn = np.arange(1, N_rn + 1, dtype=np.float32)
+        d_x   = rt.upload(data_rn)
+        d_out = rt.upload(np.array([1e9], dtype=np.float32))
+        so, _ = _build_so(reduce_min_k.func, {"N": N_rn})
+        _launch(so, "locomp_launch_reduce_min_k", (N_rn,), (1,), [d_x, d_out])
+        chk("reduce_min (N=1024 → 1.0)", d_out.numpy()[0], 1.0)
+        d_x.free(); d_out.free()
+    except Exception:
+        results.append({"name": "reduce_min", "status": "ERROR"})
+        print(f"  reduce_min             ERROR\n{traceback.format_exc()}", flush=True)
+
+    total  = len(results)
+    passed = sum(1 for r in results if r.get("status") == "PASS")
+    print(f"\n  smem/atomics/cf: {passed}/{total} passed", flush=True)
+    return results
+
+
 @app.local_entrypoint()
 def main():
-    # Fire all five sections in parallel
+    # Fire all six sections in parallel
     bench_handle      = run_cuda_benchmarks.spawn()
     gpu_ag_handle     = run_gpu_ag_cuda.spawn()
     wmma_handle       = run_wmma_gemm.spawn()
     warp_handle       = run_warp_intrinsics.spawn()
     full_bench_handle = run_full_cuda_benchmark.spawn()
+    smem_handle       = run_smem_atomics_cf.spawn()
 
     data               = bench_handle.get()
     gpu_ag_results     = gpu_ag_handle.get()
     wmma_results       = wmma_handle.get()
     warp_results       = warp_handle.get()
     full_bench_results = full_bench_handle.get()
+    smem_results       = smem_handle.get()
 
     locomp_results = data["locomp"]
     triton_results = data["triton"]
@@ -1422,11 +1742,30 @@ def main():
     print(f"  full_benchmark: {fb_pass} passed, {fb_fail} failed", flush=True)
     print("=" * W, flush=True)
 
+    # ── smem / atomics / control flow results ─────────────────────────────────
+    print(flush=True)
+    print("=" * W, flush=True)
+    print("  smem / atomics / control flow — first execution on NVIDIA GPU", flush=True)
+    print("=" * W, flush=True)
+    sm_pass = sm_fail = 0
+    for r in smem_results:
+        if r["status"] == "ERROR":
+            print(f"  {r['name']:<40} ERROR", flush=True)
+            sm_fail += 1
+        elif r["status"] == "PASS":
+            print(f"  {r['name']:<40} PASS   err={r.get('err', 0):.2e}", flush=True)
+            sm_pass += 1
+        else:
+            print(f"  {r['name']:<40} FAIL   err={r.get('err', -1):.2e}", flush=True)
+            sm_fail += 1
+    print("=" * W, flush=True)
+    print(f"  smem/atomics/cf: {sm_pass} passed, {sm_fail} failed", flush=True)
+
     # ── grand total ───────────────────────────────────────────────────────────
     grand_pass = (sum(1 for r in data['locomp'] if r.get('status') == 'PASS') +
                   sum(1 for r in gpu_ag_results if r.get('status') == 'PASS') +
                   sum(1 for r in wmma_results if r.get('status') == 'PASS') +
-                  wp_pass + fb_pass)
+                  wp_pass + fb_pass + sm_pass)
     print(flush=True)
     print(f"  GRAND TOTAL: {grand_pass} checks passed", flush=True)
 
