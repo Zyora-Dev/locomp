@@ -69,7 +69,7 @@ image = (
     )
     .run_commands(
         # Pinned to exact commit — forces Modal to rebuild image layer
-        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@c69fad2'",
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@632fc76'",
     )
 )
 
@@ -1236,12 +1236,11 @@ def run_full_cuda_benchmark():
     print(f"{'='*W}", flush=True)
 
     @locomp.kernel
-    def fp16_scale_k(X: locomp.Float16, O: locomp.Float16, N: locomp.constexpr,
-                     TILE: locomp.constexpr):
+    def fp16_scale_k(X: locomp.Float16, O: locomp.Float16):
         i = locomp.program_id(0)
-        row = locomp.arange(TILE)
-        a = locomp.load(X + i * TILE + row)
-        locomp.store(O + i * TILE + row, a)
+        row = locomp.arange(8)
+        a = locomp.load(X + i * 8 + row)
+        locomp.store(O + i * 8 + row, a)
 
     for TILE, N_TILES in [(8, 65536), (8, 1048576)]:
         N = N_TILES * TILE
@@ -1249,7 +1248,7 @@ def run_full_cuda_benchmark():
             data = np.random.randn(N).astype(np.float16)
             x_g = rt.upload(data)
             o_g = rt.upload(np.zeros(N, dtype=np.float16))
-            so, _ = _build_so(fp16_scale_k.func, {"N": N, "TILE": TILE})
+            so, _ = _build_so(fp16_scale_k.func)
 
             def gpu_fn():
                 _launch(so, "locomp_launch_fp16_scale_k", (N_TILES,), (1,), [x_g, o_g])
