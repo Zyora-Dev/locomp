@@ -343,7 +343,7 @@ class CUDACodegen:
             "    dim3 _grid(_grid_x, _grid_y, 1);",
             "    dim3 _block(_block_x, _block_y, 1);",
             f"    {self.kernel.name}_kernel<<<_grid, _block>>>({', '.join(call_args)});",
-            "    cudaDeviceSynchronize();",
+            "    // caller is responsible for synchronization",
             "}",
         ]
         return lines

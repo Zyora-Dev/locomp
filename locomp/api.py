@@ -811,8 +811,9 @@ class _KernelCall:
             ctypes.c_int(block_x), ctypes.c_int(block_y),
             ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p))
         )
+        # Sync so output is visible before any .numpy() call;
+        # not done inside the kernel launch wrapper itself to allow pipelining.
         _cuda_rt.sync()
-        # Free any tensors we auto-uploaded for this call
         for _ct in _tmp_uploads:
             _ct.free()
 
