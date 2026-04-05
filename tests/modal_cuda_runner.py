@@ -125,7 +125,7 @@ def run_cuda_benchmarks():
             cu = f.name
         so = cu.replace(".cu", ".so")
         r = subprocess.run(
-            ["nvcc", f"-arch={sm_arch}", "-O2", "-w",
+            ["nvcc", f"-arch={sm_arch}", "-O3", "-w",
              "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
             capture_output=True, text=True)
         os.unlink(cu)
