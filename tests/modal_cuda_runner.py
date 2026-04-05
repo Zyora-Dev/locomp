@@ -679,10 +679,14 @@ def run_warp_intrinsics():
             f.write(cuda_src)
             cu_path = f.name
         so_path = cu_path.replace(".cu", ".so")
-        subprocess.run(
+        res = subprocess.run(
             ["nvcc", "-O3", f"-arch={sm_arch}", "--shared", "--compiler-options",
              "-fPIC", "-o", so_path, cu_path],
-            check=True, capture_output=True)
+            capture_output=True)
+        if res.returncode != 0:
+            print(f"[nvcc ERROR] src:\n{cuda_src}", flush=True)
+            print(f"[nvcc STDERR]\n{res.stderr.decode()}", flush=True)
+            raise subprocess.CalledProcessError(res.returncode, res.args, res.stderr)
         so = ctypes.CDLL(so_path)
         _so_cache[key] = (so, param_map)
         return so, param_map
@@ -691,7 +695,7 @@ def run_warp_intrinsics():
         launch_fn = getattr(so, fn_name)
         launch_fn.restype = None
         launch_fn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_void_p]
-        ptrs = (ctypes.c_void_p * len(args))(*[a._ptr for a in args])
+        ptrs = (ctypes.c_void_p * len(args))(*[a._cuda_ptr for a in args])
         launch_fn(grid[0], grid[1] if len(grid) > 1 else 1,
                   block[0], block[1] if len(block) > 1 else 1,
                   ptrs)
@@ -899,7 +903,7 @@ def run_full_cuda_benchmark():
         launch_fn = getattr(so, fn_name)
         launch_fn.restype = None
         launch_fn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_void_p]
-        ptrs = (ctypes.c_void_p * len(args))(*[a._ptr for a in args])
+        ptrs = (ctypes.c_void_p * len(args))(*[a._cuda_ptr for a in args])
         launch_fn(grid[0], grid[1] if len(grid) > 1 else 1,
                   block[0], block[1] if len(block) > 1 else 1,
                   ptrs)
