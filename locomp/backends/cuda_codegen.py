@@ -254,7 +254,8 @@ class CUDACodegen:
                     and op.result.aliases is None
                     and op.opcode not in (OpCode.FOR_LOOP_START, OpCode.CONSTANT)
                     and not op.result.is_pointer
-                    and op.opcode != OpCode.PTR_ADD):
+                    and op.opcode != OpCode.PTR_ADD
+                    and not getattr(op.result, 'is_simdgroup_matrix', False)):
                 var = self._vname(op.result)
                 ct = _c_type(op.result.dtype)
                 lines.append(f"{self.indent}{ct} {var};")
