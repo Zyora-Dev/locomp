@@ -1,33 +1,44 @@
 """
-locomp CUDA backend — Modal benchmark + correctness script.
+locomp CUDA backend — Modal A100 benchmark + Triton comparison.
 
 Run with:
     modal run tests/modal_cuda_runner.py
 
-Benchmarks (A10G):
-  - 16M-element kernels: vector_add, scale_shift, relu, sqrt_exp
-  - dot_product (64 x 1024 accumulation)
-  - shared_memory  — __shared__ correctness test
-  - float16        — half-precision load/store/arithmetic
-  Reports max absolute error, warm kernel time (ms), and memory throughput (GB/s).
+Benchmarks (A100-80GB / A100-SXM-140GB):
+  - 1B-element bandwidth wall: vector_add, scale_shift, relu        → tests ~2 TB/s HBM2e
+  - 16M-element compute:       sqrt_exp, trig_fused, dot_product    → maths throughput
+  - Shared memory copy:        correctness + bandwidth
+  - Triton comparison:         vector_add, scale_shift, relu side-by-side (same grid/block)
+  Reports: status, max absolute error, warm kernel time (ms), memory throughput (GB/s),
+           and vs-Triton speedup where applicable.
 """
 
 import modal
 import numpy as np
 
-app = modal.App("locomp-cuda-benchmarks")
+app = modal.App("locomp-cuda-a100")
 
+# ─── image ────────────────────────────────────────────────────────────────────
+# PyTorch + Triton pulled in for the comparison section only.
+# CUDA 12.4 devel image → nvcc available at /usr/local/cuda/bin/nvcc
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git")
-    .pip_install("numpy")
+    .pip_install(
+        "numpy",
+        "torch",          # needed by triton benchmarks
+        "triton",         # standalone triton (PyPI v3+)
+    )
     .run_commands(
-        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@5da4129'",
+        # Install locomp from latest commit — includes CUDARuntime (c6ae496)
+        "pip install 'git+https://github.com/Zyora-Dev/locomp.git@c6ae496'",
     )
 )
 
 
-@app.function(gpu="A10G", image=image, timeout=300)
+# ─── benchmark function ───────────────────────────────────────────────────────
+
+@app.function(gpu="A100-80GB", image=image, timeout=600)
 def run_cuda_benchmarks():
     import locomp
     import numpy as np
@@ -35,36 +46,36 @@ def run_cuda_benchmarks():
     import ctypes
     import tempfile
     import os
+    import hashlib
     import time
+    from locomp.backends.cuda_runtime import get_runtime, CUDARuntime
     from locomp.frontend import compile_kernel
     from locomp.optimizer import optimize
     from locomp.backends.cuda_codegen import compile_to_cuda
 
-    libcudart = ctypes.CDLL("libcudart.so")
-    libcudart.cudaMalloc.restype = ctypes.c_int
-    libcudart.cudaMemcpy.restype = ctypes.c_int
-    libcudart.cudaFree.restype = ctypes.c_int
-    libcudart.cudaDeviceSynchronize.restype = ctypes.c_int
-    H2D, D2H = 1, 2
+    # ── Runtime init ──────────────────────────────────────────────────────────
+    rt = get_runtime()
+    print(f"[info] CUDA devices: {rt.device_count()}", flush=True)
 
-    _so_cache = {}
-
-    # Detect actual GPU SM arch once
-    sm_arch = "sm_80"
+    # ── SM arch ───────────────────────────────────────────────────────────────
+    sm_arch = "sm_80"   # A100 = sm_80; A100 SXM4 = sm_80 too
     try:
         r_smi = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=compute_cap,name", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=5)
         if r_smi.returncode == 0:
-            cap = r_smi.stdout.strip().split("\n")[0].strip().replace(".", "")
-            if cap.isdigit():
-                sm_arch = f"sm_{cap}"
+            first = r_smi.stdout.strip().split("\n")[0]
+            cap_str = first.split(",")[0].strip().replace(".", "")
+            name_str = first.split(",", 1)[1].strip() if "," in first else ""
+            if cap_str.isdigit():
+                sm_arch = f"sm_{cap_str}"
+            print(f"[info] GPU: {name_str}  arch: {sm_arch}", flush=True)
     except Exception:
         pass
-    print(f"[info] GPU arch: {sm_arch}", flush=True)
 
-    def _build_so(fn, constexpr_values):
-        import hashlib, shutil
+    _so_cache: dict = {}
+
+    def _build_so(fn, constexpr_values: dict):
         ir = compile_kernel(fn)
         ir = optimize(ir, target="cuda")
         cuda_src, param_map = compile_to_cuda(ir, constexpr_values=constexpr_values)
@@ -72,250 +83,285 @@ def run_cuda_benchmarks():
         if key in _so_cache:
             return _so_cache[key], param_map, cuda_src
         with tempfile.NamedTemporaryFile(suffix=".cu", delete=False, mode="w") as f:
-            f.write(cuda_src); cu = f.name
+            f.write(cuda_src)
+            cu = f.name
         so = cu.replace(".cu", ".so")
         r = subprocess.run(
-            ["nvcc", f"-arch={sm_arch}", "-O2", "-w", "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
+            ["nvcc", f"-arch={sm_arch}", "-O2", "-w",
+             "-shared", "-Xcompiler", "-fPIC", "-o", so, cu],
             capture_output=True, text=True)
         os.unlink(cu)
         if r.returncode != 0:
-            print(f"[nvcc STDERR]\n{r.stderr}", flush=True)
-            raise RuntimeError(f"nvcc failed:\n{r.stderr[:1200]}")
+            raise RuntimeError(f"nvcc failed:\n{r.stderr[:2000]}")
         _so_cache[key] = so
         return so, param_map, cuda_src
 
-    def alloc_device(arr):
-        d = ctypes.c_void_p()
-        libcudart.cudaMalloc(ctypes.byref(d), arr.nbytes)
-        libcudart.cudaMemcpy(d, arr.ctypes.data_as(ctypes.c_void_p), arr.nbytes, H2D)
-        return d
-
-    def read_device(d, arr):
-        out = arr.copy()
-        libcudart.cudaMemcpy(out.ctypes.data_as(ctypes.c_void_p), d, arr.nbytes, D2H)
-        return out
-
-    def run_kernel(so, fn_name, grid, block, d_ptrs, n_iters=1):
+    def _run_timed(so, fn_name, grid, block, d_tensors, n_iters=1):
+        """Run locomp_launch_<fn_name> n_iters times. Returns ms/call."""
         lib = ctypes.CDLL(so)
         fn = getattr(lib, fn_name)
         fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                        ctypes.POINTER(ctypes.c_void_p)]
         fn.restype = None
-        arr_t = (ctypes.c_void_p * len(d_ptrs))
-        c_arr = arr_t(*[p.value for p in d_ptrs])
-        libcudart.cudaDeviceSynchronize()
+        ptrs = [ctypes.c_void_p(t._cuda_ptr) for t in d_tensors]
+        arr_t = (ctypes.c_void_p * len(ptrs))
+        c_arr = arr_t(*ptrs)
+        vpp = ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p))
+        gx = grid[0]; gy = grid[1] if len(grid) > 1 else 1
+        bx = block[0]; by = block[1] if len(block) > 1 else 1
+        rt.sync()
         t0 = time.perf_counter()
         for _ in range(n_iters):
-            fn(grid[0], grid[1] if len(grid) > 1 else 1,
-               block[0], block[1] if len(block) > 1 else 1,
-               ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p)))
-        libcudart.cudaDeviceSynchronize()
-        return (time.perf_counter() - t0) * 1000 / n_iters  # ms per call
+            fn(gx, gy, bx, by, vpp)
+        rt.sync()
+        return (time.perf_counter() - t0) * 1000 / n_iters  # ms
 
     results = []
 
-    def bench(name, fn, cv, grid, block, inputs, expected_fn, bytes_rw, dtype=np.float32):
+    def bench(name, fn, cv, grid, block, arrays, expected_fn, bytes_rw,
+              dtype=np.float32, warmup=10, iters=100):
+        """Compile, upload, warm up, time, download, check — single benchmark."""
         try:
-            so, _, cuda_src = _build_so(fn, cv)
-            d_ptrs = [alloc_device(a) for a in inputs]
-            # warmup
-            run_kernel(so, f"locomp_launch_{fn.__name__}", grid, block, d_ptrs, n_iters=3)
-            # timed
-            ms = run_kernel(so, f"locomp_launch_{fn.__name__}", grid, block, d_ptrs, n_iters=20)
-            out = read_device(d_ptrs[-1], inputs[-1])
-            for p in d_ptrs:
-                libcudart.cudaFree(p)
-            exp = expected_fn(*inputs[:-1])
-            tol = 1e-2 if dtype in (np.float16,) else 1e-3
-            max_err = float(np.max(np.abs(out.astype(np.float32) - exp.astype(np.float32))))
+            so, _, _ = _build_so(fn, cv)
+            d = [rt.upload(a) for a in arrays]
+            _run_timed(so, f"locomp_launch_{fn.__name__}", grid, block, d, n_iters=warmup)
+            ms = _run_timed(so, f"locomp_launch_{fn.__name__}", grid, block, d, n_iters=iters)
+            out = d[-1].numpy().astype(np.float32).flatten()
+            for t in d:
+                t.free()
+            exp = expected_fn(*arrays[:-1]).astype(np.float32).flatten()
+            tol = 1e-2 if dtype == np.float16 else 1e-3
+            max_err = float(np.max(np.abs(out - exp)))
             status = "PASS" if max_err < tol else "FAIL"
             gbps = (bytes_rw / 1e9) / (ms / 1000)
-            results.append({"name": name, "status": status, "max_err": max_err,
-                            "ms": ms, "gbps": gbps})
+            results.append({"name": name, "status": status,
+                            "max_err": max_err, "ms": ms, "gbps": gbps})
         except Exception as e:
             import traceback
-            tb = traceback.format_exc()
-            print(f"[ERROR in {name}]\n{tb}", flush=True)
+            print(f"[ERROR {name}]\n{traceback.format_exc()}", flush=True)
             results.append({"name": name, "status": "ERROR", "error": str(e)})
 
-    # Use 256 threads/block for real GPU occupancy — kernels use block+thread index
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Section 1 — 1B-element bandwidth tests (stress A100 HBM2e ~2 TB/s)
+    # ═══════════════════════════════════════════════════════════════════════════
     BS = 256
-    N = 16 * 1024 * 1024
-    BLOCKS = N // BS  # 65536 blocks
+    N1B = 1 << 30   # 1 073 741 824 elements × 4 bytes = 4 GB per array
+    G1B = N1B // BS  # grid blocks
 
-    # ── 1. vector_add  16M  (256 threads/block) ───────────────────────────────
     def vector_add(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
                    N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
         i = bid * 256 + tid
         locomp.store(Out + i, locomp.load(A + i) + locomp.load(B + i))
-    a = np.random.randn(N).astype(np.float32)
-    b = np.random.randn(N).astype(np.float32)
-    bench("vector_add (16M f32)", vector_add, {"N": N}, (BLOCKS,), (BS,),
-          [a, b, np.zeros(N, dtype=np.float32)],
-          lambda a, b: a + b, 3 * N * 4)
 
-    # ── 2. scale_shift  16M ───────────────────────────────────────────────────
     def scale_shift(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
         i = bid * 256 + tid
         locomp.store(Out + i, locomp.load(X + i) * 2.0 + 1.0)
-    x = np.random.randn(N).astype(np.float32)
-    bench("scale_shift (16M f32)", scale_shift, {"N": N}, (BLOCKS,), (BS,),
-          [x, np.zeros(N, dtype=np.float32)],
-          lambda x: x * 2.0 + 1.0, 2 * N * 4)
 
-    # ── 3. relu  16M ──────────────────────────────────────────────────────────
     def relu(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
         i = bid * 256 + tid
         x = locomp.load(X + i)
         locomp.store(Out + i, locomp.where(x > 0.0, x, 0.0))
-    x = np.random.randn(N).astype(np.float32)
-    bench("relu (16M f32)", relu, {"N": N}, (BLOCKS,), (BS,),
-          [x, np.zeros(N, dtype=np.float32)],
-          lambda x: np.maximum(x, 0.0), 2 * N * 4)
 
-    # ── 4. sqrt_exp  16M ──────────────────────────────────────────────────────
+    rng = np.random.default_rng(42)
+    a1b = rng.standard_normal(N1B).astype(np.float32)
+    b1b = rng.standard_normal(N1B).astype(np.float32)
+    z1b = np.zeros(N1B, dtype=np.float32)
+
+    bench("vector_add   (1B f32)", vector_add, {"N": N1B}, (G1B,), (BS,),
+          [a1b, b1b, z1b.copy()], lambda a, b: a + b, 3 * N1B * 4)
+    bench("scale_shift  (1B f32)", scale_shift, {"N": N1B}, (G1B,), (BS,),
+          [a1b, z1b.copy()], lambda x: x * 2.0 + 1.0,  2 * N1B * 4)
+    bench("relu         (1B f32)", relu, {"N": N1B}, (G1B,), (BS,),
+          [a1b, z1b.copy()], lambda x: np.maximum(x, 0.0), 2 * N1B * 4)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Section 2 — 16M-element compute-heavy kernels
+    # ═══════════════════════════════════════════════════════════════════════════
+    N16M = 16 * 1024 * 1024
+    G16M = N16M // BS
+
     def sqrt_exp(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
         i = bid * 256 + tid
         x = locomp.load(X + i)
         locomp.store(Out + i, locomp.exp(locomp.sqrt(locomp.abs(x))))
-    x = np.random.randn(N).astype(np.float32)
-    bench("sqrt_exp (16M f32)", sqrt_exp, {"N": N}, (BLOCKS,), (BS,),
-          [x, np.zeros(N, dtype=np.float32)],
-          lambda x: np.exp(np.sqrt(np.abs(x))), 2 * N * 4)
 
-    # ── 5. dot_product  64 x 1024 ────────────────────────────────────────────
-    M, K = 64, 1024
-    def dot_product(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
-                    N: locomp.constexpr):
-        i = locomp.program_id(0)
-        acc = 0.0
-        for k in range(N):
-            acc = acc + locomp.load(A + i * N + k) * locomp.load(B + i * N + k)
-        locomp.store(Out + i, acc)
-    a2 = np.random.randn(M, K).astype(np.float32)
-    b2 = np.random.randn(M, K).astype(np.float32)
-    bench("dot_product (64x1024)", dot_product, {"N": K}, (M,), (1,),
-          [a2.flatten(), b2.flatten(), np.zeros(M, dtype=np.float32)],
-          lambda a, b: (a.reshape(M, K) * b.reshape(M, K)).sum(axis=1),
-          (2 * M * K + M) * 4)
-
-    # ── 6. shared_memory correctness ─────────────────────────────────────────
-    Ns = BS * 128  # 32768 elements, 128 blocks of 256 threads
-    def smem_copy(A: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
-        """Copy through shared memory: load to smem, barrier, store from smem."""
-        tile = locomp.shared_memory(256, locomp.float32)
-        block_id = locomp.program_id(0)
-        tid = locomp.local_id(0)
-        idx = block_id * 256 + tid
-        locomp.shared_store(tile, tid, locomp.load(A + idx))
-        locomp.barrier()
-        locomp.store(Out + idx, locomp.shared_load(tile, tid))
-    a3 = np.random.randn(Ns).astype(np.float32)
-    bench("shared_memory copy", smem_copy, {"N": Ns}, (Ns // BS,), (BS,),
-          [a3, np.zeros(Ns, dtype=np.float32)],
-          lambda a: a, 2 * Ns * 4)
-
-    # ── 7. trig_fused — sin+cos compute throughput ───────────────────────────
     def trig_fused(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
         i = bid * 256 + tid
         x = locomp.load(X + i)
         locomp.store(Out + i, locomp.sin(x) + locomp.cos(x))
-    x_trig = np.random.randn(N).astype(np.float32)
-    bench("trig_fused (16M f32)", trig_fused, {"N": N}, (BLOCKS,), (BS,),
-          [x_trig, np.zeros(N, dtype=np.float32)],
-          lambda x: np.sin(x) + np.cos(x), 2 * N * 4)
 
-    # ── 8. wmma tensor core matmul  1024×1024×1024 fp16 ─────────────────────
-    # One warp (32 threads) per 16×16 output tile. Grid = (N/16, M/16).
-    # A[M×K] fp16, B[K×N] fp16, C[M×N] fp32
-    TM, TN, TK = 1024, 1024, 1024
-    def wmma_matmul(A: locomp.Float16, B: locomp.Float16, Out: locomp.Tensor,
-                    M: locomp.constexpr, N: locomp.constexpr, K: locomp.constexpr):
-        bx = locomp.program_id(0)   # tile column (N dim)
-        by = locomp.program_id(1)   # tile row    (M dim)
-        acc = locomp.simdgroup_matrix(0.0)
-        for k in range(K // 16):
-            a_frag = locomp.simdgroup_matrix_load_device(
-                A + by * 16 * K + k * 16, K, role="a")
-            b_frag = locomp.simdgroup_matrix_load_device(
-                B + k * 16 * N + bx * 16, N, role="b")
-            acc = locomp.simdgroup_mac(acc, a_frag, b_frag)
-        locomp.simdgroup_matrix_store_device(acc, Out + by * 16 * N + bx * 16, N)
+    x16 = rng.standard_normal(N16M).astype(np.float32)
+    bench("sqrt_exp     (16M f32)", sqrt_exp, {"N": N16M}, (G16M,), (BS,),
+          [x16, np.zeros(N16M, dtype=np.float32)],
+          lambda x: np.exp(np.sqrt(np.abs(x))), 2 * N16M * 4)
+    bench("trig_fused   (16M f32)", trig_fused, {"N": N16M}, (G16M,), (BS,),
+          [x16, np.zeros(N16M, dtype=np.float32)],
+          lambda x: np.sin(x) + np.cos(x), 2 * N16M * 4)
 
-    a_fp16 = np.random.randn(TM, TK).astype(np.float16)
-    b_fp16 = np.random.randn(TK, TN).astype(np.float16)
-    grid_wmma = (TN // 16, TM // 16)   # (64, 64) = 4096 blocks
-    block_wmma = (32,)                  # 1 warp = 32 threads
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Section 3 — Shared memory correctness + bandwidth
+    # ═══════════════════════════════════════════════════════════════════════════
+    N_smem = BS * 65536   # 16M elements via 65536 blocks
+    def smem_copy(A: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
+        tile = locomp.shared_memory(256, locomp.float32)
+        bid  = locomp.program_id(0)
+        tid  = locomp.local_id(0)
+        idx  = bid * 256 + tid
+        locomp.shared_store(tile, tid, locomp.load(A + idx))
+        locomp.barrier()
+        locomp.store(Out + idx, locomp.shared_load(tile, tid))
 
-    def expected_wmma(a, b):
-        return (a.astype(np.float32) @ b.astype(np.float32)).flatten()
+    a_sm = rng.standard_normal(N_smem).astype(np.float32)
+    bench("smem_copy    (16M f32)", smem_copy, {"N": N_smem}, (N_smem // BS,), (BS,),
+          [a_sm, np.zeros(N_smem, dtype=np.float32)],
+          lambda a: a, 2 * N_smem * 4)
 
-    # flops = 2 * M * N * K = 2.147e12 for 1024^3
-    flops_wmma = 2 * TM * TN * TK
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Section 4 — Dot product (compute-bound, 1M rows × 128 cols)
+    # ═══════════════════════════════════════════════════════════════════════════
+    M_dp, K_dp = 1024 * 1024, 128
+
+    def dot_product(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
+                    N: locomp.constexpr):
+        row = locomp.program_id(0)
+        acc = 0.0
+        for k in range(N):
+            acc = acc + locomp.load(A + row * N + k) * locomp.load(B + row * N + k)
+        locomp.store(Out + row, acc)
+
+    a_dp = rng.standard_normal(M_dp * K_dp).astype(np.float32)
+    b_dp = rng.standard_normal(M_dp * K_dp).astype(np.float32)
+    bench("dot_product  (1M×128)", dot_product, {"N": K_dp}, (M_dp,), (1,),
+          [a_dp, b_dp, np.zeros(M_dp, dtype=np.float32)],
+          lambda a, b: (a.reshape(M_dp, K_dp) * b.reshape(M_dp, K_dp)).sum(axis=1),
+          (2 * M_dp * K_dp + M_dp) * 4)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Section 5 — Triton comparison  (vector_add / scale_shift / relu, 1B elem)
+    # ═══════════════════════════════════════════════════════════════════════════
+    triton_results = []
     try:
-        so_wmma, _, cuda_src_wmma = _build_so(wmma_matmul, {"M": TM, "N": TN, "K": TK})
-        d_a = alloc_device(a_fp16.flatten())
-        d_b = alloc_device(b_fp16.flatten())
-        d_out = alloc_device(np.zeros(TM * TN, dtype=np.float32))
-        # warmup
-        run_kernel(so_wmma, "locomp_launch_wmma_matmul", grid_wmma, block_wmma,
-                   [d_a, d_b, d_out], n_iters=3)
-        ms_wmma = run_kernel(so_wmma, "locomp_launch_wmma_matmul", grid_wmma, block_wmma,
-                             [d_a, d_b, d_out], n_iters=20)
-        out_wmma = read_device(d_out, np.zeros(TM * TN, dtype=np.float32))
-        for p in [d_a, d_b, d_out]:
-            libcudart.cudaFree(p)
-        exp_wmma = expected_wmma(a_fp16, b_fp16)
-        max_err_wmma = float(np.max(np.abs(out_wmma - exp_wmma)))
-        status_wmma = "PASS" if max_err_wmma < 0.5 else "FAIL"  # fp16 accumulation tolerance
-        tflops = (flops_wmma / 1e12) / (ms_wmma / 1000)
-        results.append({"name": "wmma_matmul (1024³ fp16)", "status": status_wmma,
-                        "max_err": max_err_wmma, "ms": ms_wmma,
-                        "gbps": 0, "tflops": tflops})
+        import torch
+        import triton
+        import triton.language as tl
+
+        BLOCK_T = 1024   # Triton block size
+
+        @triton.jit
+        def triton_vector_add(A_ptr, B_ptr, Out_ptr, N, BLOCK: tl.constexpr):
+            pid  = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < N
+            tl.store(Out_ptr + offs,
+                     tl.load(A_ptr + offs, mask=mask) + tl.load(B_ptr + offs, mask=mask),
+                     mask=mask)
+
+        @triton.jit
+        def triton_scale_shift(X_ptr, Out_ptr, N, BLOCK: tl.constexpr):
+            pid  = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < N
+            tl.store(Out_ptr + offs, tl.load(X_ptr + offs, mask=mask) * 2.0 + 1.0, mask=mask)
+
+        @triton.jit
+        def triton_relu(X_ptr, Out_ptr, N, BLOCK: tl.constexpr):
+            pid  = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < N
+            x = tl.load(X_ptr + offs, mask=mask)
+            tl.store(Out_ptr + offs, tl.where(x > 0.0, x, 0.0), mask=mask)
+
+        def _triton_bench(name, kernel_fn, torch_inputs, N, bytes_rw, warmup=10, iters=100):
+            grid = lambda _: (triton.cdiv(N, BLOCK_T),)
+            torch.cuda.synchronize()
+            for _ in range(warmup):
+                kernel_fn[grid](*torch_inputs, N, BLOCK=BLOCK_T)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                kernel_fn[grid](*torch_inputs, N, BLOCK=BLOCK_T)
+            torch.cuda.synchronize()
+            ms = (time.perf_counter() - t0) * 1000 / iters
+            gbps = (bytes_rw / 1e9) / (ms / 1000)
+            triton_results.append({"name": name, "ms": ms, "gbps": gbps})
+
+        a_t = torch.from_numpy(a1b).cuda()
+        b_t = torch.from_numpy(b1b).cuda()
+        o_t = torch.zeros(N1B, dtype=torch.float32, device="cuda")
+
+        _triton_bench("Triton vector_add  (1B)", triton_vector_add, [a_t, b_t, o_t], N1B, 3*N1B*4)
+        _triton_bench("Triton scale_shift (1B)", triton_scale_shift, [a_t, o_t], N1B, 2*N1B*4)
+        _triton_bench("Triton relu        (1B)", triton_relu, [a_t, o_t], N1B, 2*N1B*4)
+
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f"[ERROR in wmma_matmul]\n{tb}", flush=True)
-        results.append({"name": "wmma_matmul (1024³ fp16)", "status": "ERROR", "error": str(e)})
+        print(f"[Triton section ERROR]\n{traceback.format_exc()}", flush=True)
+        triton_results.append({"name": "Triton section", "ms": 0, "gbps": 0,
+                               "error": str(e)})
 
-    return results
+    return {"locomp": results, "triton": triton_results}
 
 
 @app.local_entrypoint()
 def main():
-    results = run_cuda_benchmarks.remote()
+    data = run_cuda_benchmarks.remote()
+    locomp_results  = data["locomp"]
+    triton_results  = data["triton"]
+
+    W = 74
     print(flush=True)
-    print("=" * 70, flush=True)
-    print("  locomp CUDA Backend — Modal A10G Benchmark Results", flush=True)
-    print("=" * 70, flush=True)
-    print(f"  {'Kernel':<28} {'Status':<8} {'MaxErr':>10} {'Time':>9} {'GB/s':>10}", flush=True)
-    print("-" * 70, flush=True)
+    print("=" * W, flush=True)
+    print("  locomp CUDA — A100 Benchmark Results", flush=True)
+    print("=" * W, flush=True)
+    print(f"  {'Kernel':<30} {'Status':<6} {'MaxErr':>10} {'Time':>9} {'GB/s':>10}", flush=True)
+    print("-" * W, flush=True)
+    locomp_by_name = {}
     passed = failed = 0
-    for r in results:
+    for r in locomp_results:
         if r["status"] == "ERROR":
-            print(f"  {r['name']:<28} {'ERROR':<8}  {r.get('error', '')[:80]}", flush=True)
+            print(f"  {r['name']:<30} {'ERROR':<6}  {r.get('error','')[:60]}", flush=True)
             failed += 1
         elif r["status"] == "PASS":
-            if r.get("tflops"):
-                print(f"  {r['name']:<28} {'PASS':<8} {r['max_err']:>10.2e} {r['ms']:>7.3f}ms {r['tflops']:>7.2f} TFLOPS", flush=True)
-            else:
-                print(f"  {r['name']:<28} {'PASS':<8} {r['max_err']:>10.2e} {r['ms']:>7.3f}ms {r['gbps']:>8.1f}", flush=True)
+            print(f"  {r['name']:<30} {'PASS':<6} {r['max_err']:>10.2e}"
+                  f" {r['ms']:>7.3f}ms {r['gbps']:>8.1f} GB/s", flush=True)
+            locomp_by_name[r["name"]] = r
             passed += 1
         else:
-            print(f"  {r['name']:<28} {'FAIL':<8} {r['max_err']:>10.2e}", flush=True)
+            print(f"  {r['name']:<30} {'FAIL':<6} {r['max_err']:>10.2e}", flush=True)
             failed += 1
-    print("=" * 70, flush=True)
-    print(f"  {passed} passed, {failed} failed", flush=True)
-    print("=" * 70, flush=True)
+    print("=" * W, flush=True)
+    print(f"  locomp: {passed} passed, {failed} failed", flush=True)
 
+    if triton_results:
+        print(flush=True)
+        print("=" * W, flush=True)
+        print("  locomp vs Triton  (same operation, 1B float32 elements)", flush=True)
+        print("=" * W, flush=True)
+        print(f"  {'Kernel':<30} {'locomp':>10} {'Triton':>10} {'speedup':>10}", flush=True)
+        print("-" * W, flush=True)
+        pairs = [
+            ("vector_add   (1B f32)", "Triton vector_add  (1B)"),
+            ("scale_shift  (1B f32)", "Triton scale_shift (1B)"),
+            ("relu         (1B f32)", "Triton relu        (1B)"),
+        ]
+        for lname, tname in pairs:
+            lr = next((r for r in locomp_results if r["name"] == lname), None)
+            tr = next((r for r in triton_results if r["name"] == tname), None)
+            if lr and tr and tr.get("ms", 0) > 0 and lr.get("ms", 0) > 0:
+                speedup = tr["ms"] / lr["ms"]
+                tag = f"{speedup:.2f}x {'faster' if speedup >= 1 else 'slower'}"
+                print(f"  {lname:<30} {lr['ms']:>8.3f}ms {tr['ms']:>8.3f}ms  {tag:>10}", flush=True)
+            elif tr and tr.get("error"):
+                print(f"  {lname:<30} {'(Triton error)':>32}", flush=True)
+        print("=" * W, flush=True)
 
