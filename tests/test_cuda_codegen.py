@@ -200,8 +200,8 @@ def test_cuda_wmma_mma_sync():
     def k(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
           N: locomp.constexpr):
         i = locomp.program_id(0)
-        a = locomp.simdgroup_matrix_load_device(A + i, 16)
-        b = locomp.simdgroup_matrix_load_device(B + i, 16)
+        a = locomp.simdgroup_matrix_load_device(A + i, 16, role="a")
+        b = locomp.simdgroup_matrix_load_device(B + i, 16, role="b")
         acc = locomp.simdgroup_matrix(0.0)
         result = locomp.simdgroup_mac(acc, a, b)
         locomp.simdgroup_matrix_store_device(result, Out + i, 16)
@@ -210,6 +210,8 @@ def test_cuda_wmma_mma_sync():
     assert "wmma::mma_sync" in src
     assert "wmma::load_matrix_sync" in src
     assert "wmma::store_matrix_sync" in src
+    assert "wmma::matrix_a" in src
+    assert "wmma::matrix_b" in src
 
 
 def test_cuda_wmma_includes_mma_header():

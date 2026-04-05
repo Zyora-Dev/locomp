@@ -34,12 +34,26 @@ _disk_cache: dict | None = None
 
 
 def _get_gpu_name() -> str:
-    """Get the Metal GPU device name (e.g. 'Apple M1')."""
+    """Get the GPU device name for cache keying (Metal or CUDA)."""
+    # Try Metal first (macOS)
     try:
         from locomp.backends.metal_runtime import get_runtime
         return get_runtime().device_name
     except Exception:
-        return "unknown"
+        pass
+    # Try CUDA via nvidia-smi
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            name = r.stdout.strip().split("\n")[0].strip()
+            if name:
+                return name
+    except Exception:
+        pass
+    return "unknown"
 
 
 def _load_disk_cache() -> dict:
@@ -145,7 +159,7 @@ class AutotunedKernel:
             name = self._py_names[i]
             user_values[name] = arg
             if isinstance(arg, (int, float)) and not hasattr(arg, '_metal_buffer'):
-                py_constexprs[name] = int(arg)
+                py_constexprs[name] = float(arg) if isinstance(arg, float) else int(arg)
 
         # Cache key from user-specified key params
         cache_key = tuple(py_constexprs.get(k, 0) for k in self.key)
@@ -212,15 +226,17 @@ class AutotunedKernel:
         # User-provided tensor args stay as-is; constexpr args come from resolved dict.
         full_args = []
         for name in self._py_names:
-            if name in user_values and hasattr(user_values[name], '_metal_buffer'):
-                # Tensor arg — pass through
-                full_args.append(user_values[name])
-            elif name in resolved:
-                # Constexpr — from user or config
+            if name in resolved and name not in user_values:
+                # Constexpr supplied by config only
                 full_args.append(resolved[name])
             elif name in user_values:
-                # Tensor passed as ndarray or other
-                full_args.append(user_values[name])
+                val = user_values[name]
+                if isinstance(val, (int, float)) and name in resolved:
+                    # Constexpr — use resolved (may be overridden by config)
+                    full_args.append(resolved[name])
+                else:
+                    # Tensor arg (Metal buffer, CUDA ndarray, LocompTensor, etc.)
+                    full_args.append(val)
             else:
                 raise ValueError(f"No value for parameter '{name}' — "
                                  f"not provided by user or Config")

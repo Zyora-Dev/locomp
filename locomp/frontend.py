@@ -549,15 +549,20 @@ class KernelCompiler(ast.NodeVisitor):
                                attrs={"source": "shared"})
             return result
 
-        # locomp.simdgroup_matrix_load_device(ptr, stride)
-        # — loads 8×8 block from device pointer with given stride
+        # locomp.simdgroup_matrix_load_device(ptr, stride, role="a")
+        # — loads matrix from device pointer with given stride
         if func_name == "simdgroup_matrix_load_device":
             ptr = self._visit_expr(node.args[0])
             stride = self._visit_expr(node.args[1])
+            role = "a"
+            for kw in node.keywords:
+                if kw.arg == "role":
+                    import ast as _ast
+                    role = _ast.literal_eval(kw.value)
             result = self.kernel.new_value("smat", self._resolve_ptr_dtype(ptr))
             result.is_simdgroup_matrix = True
             self.kernel.add_op(OpCode.SIMDGROUP_MATRIX_LOAD, result, [ptr, stride],
-                               attrs={"source": "device"})
+                               attrs={"source": "device", "role": role})
             return result
 
         # locomp.simdgroup_matrix_store(mat, shared_arr, offset, stride)
