@@ -8,6 +8,7 @@ from locomp.frontend import LocompKernelError
 from locomp.cache import clear as clear_kernel_cache, cache_dir as kernel_cache_dir
 from locomp.graph import graph, KernelGraph
 from locomp.profiler import profile, Profiler, ProfileResult
+from locomp import autograd as ag
 from locomp.api import (
     kernel,
     program_id,
