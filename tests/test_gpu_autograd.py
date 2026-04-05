@@ -383,3 +383,168 @@ from locomp.gpu_autograd import (
     _bwd_add_accumulate, _bwd_mul, _bwd_relu, _bwd_exp, _bwd_log,
     _bwd_broadcast, _bwd_matvec_x, _bwd_matvec_A,
 )
+
+
+# ─── pow ─────────────────────────────────────────────────────────────────────
+
+@macos_only
+def test_gpu_pow_forward():
+    x = gpu_ag.tensor(np.array([1.0, 2.0, 3.0, 4.0]), requires_grad=True)
+    out = gpu_ag.pow(x, 2.0)
+    np.testing.assert_allclose(out.numpy(), np.array([1., 4., 9., 16.]), rtol=1e-5)
+
+@macos_only
+def test_gpu_pow_backward():
+    x_np = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    x = gpu_ag.tensor(x_np, requires_grad=True)
+    loss = gpu_ag.sum(gpu_ag.pow(x, 3.0))
+    gpu_ag.backward(loss)
+    expected = 3.0 * x_np ** 2.0
+    np.testing.assert_allclose(x.grad.numpy(), expected, rtol=1e-4)
+
+
+# ─── sigmoid ─────────────────────────────────────────────────────────────────
+
+@macos_only
+def test_gpu_sigmoid_forward():
+    x = gpu_ag.tensor(np.array([0.0, 1.0, -1.0, 2.0]), requires_grad=True)
+    out = gpu_ag.sigmoid(x)
+    expected = 1.0 / (1.0 + np.exp(-np.array([0., 1., -1., 2.], dtype=np.float32)))
+    np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5)
+
+@macos_only
+def test_gpu_sigmoid_backward():
+    x_np = np.array([0.0, 1.0, -1.0, 2.0], dtype=np.float32)
+    x = gpu_ag.tensor(x_np, requires_grad=True)
+    loss = gpu_ag.sum(gpu_ag.sigmoid(x))
+    gpu_ag.backward(loss)
+    s = 1.0 / (1.0 + np.exp(-x_np))
+    expected = s * (1.0 - s)
+    np.testing.assert_allclose(x.grad.numpy(), expected, rtol=1e-5)
+
+
+# ─── tanh ────────────────────────────────────────────────────────────────────
+
+@macos_only
+def test_gpu_tanh_forward():
+    x = gpu_ag.tensor(np.array([0.0, 0.5, -0.5, 1.0]), requires_grad=True)
+    out = gpu_ag.tanh(x)
+    expected = np.tanh(np.array([0., 0.5, -0.5, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5)
+
+@macos_only
+def test_gpu_tanh_backward():
+    x_np = np.array([0.0, 0.5, -0.5, 1.0], dtype=np.float32)
+    x = gpu_ag.tensor(x_np, requires_grad=True)
+    loss = gpu_ag.sum(gpu_ag.tanh(x))
+    gpu_ag.backward(loss)
+    t = np.tanh(x_np)
+    expected = 1.0 - t * t
+    np.testing.assert_allclose(x.grad.numpy(), expected, rtol=1e-5)
+
+
+# ─── matmul ──────────────────────────────────────────────────────────────────
+
+@macos_only
+def test_gpu_matmul_forward():
+    M, K, N = 4, 3, 2
+    A_np = np.random.randn(M, K).astype(np.float32)
+    B_np = np.random.randn(K, N).astype(np.float32)
+    A = gpu_ag.tensor(A_np.ravel(), requires_grad=True)
+    B = gpu_ag.tensor(B_np.ravel(), requires_grad=True)
+    C = gpu_ag.matmul(A, B, M, K, N)
+    expected = (A_np @ B_np).ravel()
+    np.testing.assert_allclose(C.numpy(), expected, rtol=1e-5)
+
+@macos_only
+def test_gpu_matmul_backward_A():
+    M, K, N = 4, 3, 2
+    np.random.seed(42)
+    A_np = np.random.randn(M, K).astype(np.float32)
+    B_np = np.random.randn(K, N).astype(np.float32)
+    A = gpu_ag.tensor(A_np.ravel(), requires_grad=True)
+    B = gpu_ag.tensor(B_np.ravel())
+    C = gpu_ag.matmul(A, B, M, K, N)
+    loss = gpu_ag.sum(C)
+    gpu_ag.backward(loss)
+    # dA = dC @ B^T  (dC = ones M×N)
+    expected = (np.ones((M, N), dtype=np.float32) @ B_np.T).ravel()
+    np.testing.assert_allclose(A.grad.numpy(), expected, rtol=1e-4)
+
+@macos_only
+def test_gpu_matmul_backward_B():
+    M, K, N = 4, 3, 2
+    np.random.seed(7)
+    A_np = np.random.randn(M, K).astype(np.float32)
+    B_np = np.random.randn(K, N).astype(np.float32)
+    A = gpu_ag.tensor(A_np.ravel())
+    B = gpu_ag.tensor(B_np.ravel(), requires_grad=True)
+    C = gpu_ag.matmul(A, B, M, K, N)
+    loss = gpu_ag.sum(C)
+    gpu_ag.backward(loss)
+    # dB = A^T @ dC  (dC = ones M×N)
+    expected = (A_np.T @ np.ones((M, N), dtype=np.float32)).ravel()
+    np.testing.assert_allclose(B.grad.numpy(), expected, rtol=1e-4)
+
+
+# ─── softmax ─────────────────────────────────────────────────────────────────
+
+@macos_only
+def test_gpu_softmax_forward():
+    M, N = 4, 8
+    x_np = np.random.randn(M, N).astype(np.float32)
+    x = gpu_ag.tensor(x_np.ravel(), requires_grad=True)
+    out = gpu_ag.softmax(x, M, N)
+    # row sums must be 1
+    np.testing.assert_allclose(out.numpy().reshape(M, N).sum(axis=1),
+                                np.ones(M), rtol=1e-5)
+
+@macos_only
+def test_gpu_softmax_backward():
+    M, N = 2, 4
+    np.random.seed(1)
+    x_np = np.random.randn(M, N).astype(np.float32)
+    x = gpu_ag.tensor(x_np.ravel(), requires_grad=True)
+    out = gpu_ag.softmax(x, M, N)
+    loss = gpu_ag.sum(out)
+    gpu_ag.backward(loss)
+    # grad of sum(softmax(x)) wrt x is zero (softmax sums to 1 always)
+    np.testing.assert_allclose(x.grad.numpy(), np.zeros(M * N), atol=1e-5)
+
+
+# ─── cross_entropy ───────────────────────────────────────────────────────────
+
+@macos_only
+def test_gpu_cross_entropy_forward():
+    B, N = 4, 8
+    np.random.seed(3)
+    q_np = np.random.dirichlet(np.ones(N), size=B).astype(np.float32)  # valid probs
+    p_np = np.eye(N, dtype=np.float32)[[np.random.randint(N) for _ in range(B)]]
+    q = gpu_ag.tensor(q_np.ravel(), requires_grad=True)
+    p = gpu_ag.tensor(p_np.ravel())
+    loss = gpu_ag.cross_entropy(q, p, B, N)
+    expected = -(p_np * np.log(q_np + 1e-8)).sum(axis=1)
+    np.testing.assert_allclose(loss.numpy(), expected, rtol=1e-4)
+
+@macos_only
+def test_gpu_cross_entropy_backward():
+    B, N = 3, 5
+    np.random.seed(9)
+    q_np = np.random.dirichlet(np.ones(N), size=B).astype(np.float32)
+    p_np = np.eye(N, dtype=np.float32)[[np.random.randint(N) for _ in range(B)]]
+    q = gpu_ag.tensor(q_np.ravel(), requires_grad=True)
+    p = gpu_ag.tensor(p_np.ravel())
+    loss_t = gpu_ag.cross_entropy(q, p, B, N)
+    scalar_loss = gpu_ag.sum(loss_t)
+    gpu_ag.backward(scalar_loss)
+    # dL/dq[b,k] = -p[b,k] / (q[b,k] + eps)  (summed over batch via sum backward)
+    expected = (-p_np / (q_np + 1e-8)).ravel()
+    np.testing.assert_allclose(q.grad.numpy(), expected, rtol=1e-3)
+
+
+# ─── new ops accessible on locomp.gpu_ag namespace ───────────────────────────
+
+def test_gpu_ag_new_ops_accessible():
+    import locomp
+    for op in ("pow", "sigmoid", "tanh", "matmul", "softmax", "cross_entropy"):
+        assert hasattr(locomp.gpu_ag, op), f"locomp.gpu_ag.{op} not found"

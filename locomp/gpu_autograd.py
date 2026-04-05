@@ -178,6 +178,127 @@ def _fwd_mean_flat(A: _T, Out: _T, N: _cx):
 
 # _bwd_mean reuses _bwd_broadcast with G = grad_scalar / N computed on CPU
 
+# ── pow ──────────────────────────────────────────────────────────────────────
+
+def _fwd_pow(A: _T, Out: _T, N: _cx, Exp: _cx):
+    i = locomp.program_id(0)
+    locomp.store(Out + i, locomp.pow(locomp.load(A + i), Exp))
+
+def _bwd_pow(GradOut: _T, FwdIn: _T, GradIn: _T, N: _cx, Exp: _cx):
+    """GradIn += GradOut * Exp * a^(Exp-1)"""
+    i = locomp.program_id(0)
+    g = locomp.load(GradOut + i) * Exp * locomp.pow(locomp.load(FwdIn + i), Exp - 1.0)
+    locomp.store(GradIn + i, locomp.load(GradIn + i) + g)
+
+# ── sigmoid ──────────────────────────────────────────────────────────────────
+
+def _fwd_sigmoid_k(A: _T, Out: _T, N: _cx):
+    i = locomp.program_id(0)
+    locomp.store(Out + i, locomp.sigmoid(locomp.load(A + i)))
+
+def _bwd_sigmoid_k(GradOut: _T, FwdOut: _T, GradIn: _T, N: _cx):
+    """GradIn += GradOut * s*(1-s)"""
+    i = locomp.program_id(0)
+    s = locomp.load(FwdOut + i)
+    g = locomp.load(GradOut + i) * s * (1.0 - s)
+    locomp.store(GradIn + i, locomp.load(GradIn + i) + g)
+
+# ── tanh ─────────────────────────────────────────────────────────────────────
+
+def _fwd_tanh_k(A: _T, Out: _T, N: _cx):
+    i = locomp.program_id(0)
+    locomp.store(Out + i, locomp.tanh(locomp.load(A + i)))
+
+def _bwd_tanh_k(GradOut: _T, FwdOut: _T, GradIn: _T, N: _cx):
+    """GradIn += GradOut * (1 - tanh^2)"""
+    i = locomp.program_id(0)
+    t = locomp.load(FwdOut + i)
+    g = locomp.load(GradOut + i) * (1.0 - t * t)
+    locomp.store(GradIn + i, locomp.load(GradIn + i) + g)
+
+# ── matmul: C = A @ B  (A: M×K, B: K×N, C: M×N, all flattened) ─────────────
+
+def _fwd_matmul(A: _T, B: _T, C: _T, M: _cx, K: _cx, N: _cx):
+    """1 thread per output element. idx = row*N + col."""
+    idx = locomp.program_id(0)
+    row = idx // N
+    col = idx % N
+    acc = 0.0
+    for k in range(K):
+        acc = acc + locomp.load(A + row * K + k) * locomp.load(B + k * N + col)
+    locomp.store(C + idx, acc)
+
+def _bwd_matmul_A(GradC: _T, B: _T, GradA: _T, M: _cx, K: _cx, N: _cx):
+    """dA[row,k] += sum_col(dC[row,col] * B[k,col])  — 1 thread per (row,k)"""
+    idx = locomp.program_id(0)
+    row = idx // K
+    k = idx % K
+    acc = 0.0
+    for col in range(N):
+        acc = acc + locomp.load(GradC + row * N + col) * locomp.load(B + k * N + col)
+    locomp.store(GradA + idx, locomp.load(GradA + idx) + acc)
+
+def _bwd_matmul_B(GradC: _T, A: _T, GradB: _T, M: _cx, K: _cx, N: _cx):
+    """dB[k,col] += sum_row(A[row,k] * dC[row,col])  — 1 thread per (k,col)"""
+    idx = locomp.program_id(0)
+    k = idx // N
+    col = idx % N
+    acc = 0.0
+    for row in range(M):
+        acc = acc + locomp.load(A + row * K + k) * locomp.load(GradC + row * N + col)
+    locomp.store(GradB + idx, locomp.load(GradB + idx) + acc)
+
+# ── softmax (row-wise, flattened M×N) ────────────────────────────────────────
+
+def _fwd_softmax_row(A: _T, Out: _T, M: _cx, N: _cx):
+    """1 thread per row. 3-pass: max → exp_sum → normalize."""
+    row = locomp.program_id(0)
+    mx = -3.4e38
+    for k in range(N):
+        v = locomp.load(A + row * N + k)
+        mx = locomp.where(v > mx, v, mx)
+    s = 0.0
+    for k in range(N):
+        s = s + locomp.exp(locomp.load(A + row * N + k) - mx)
+    for k in range(N):
+        v = locomp.exp(locomp.load(A + row * N + k) - mx)
+        locomp.store(Out + row * N + k, v / s)
+
+def _bwd_softmax_row(GradOut: _T, FwdOut: _T, GradIn: _T, M: _cx, N: _cx):
+    """dX[i] += S[i] * (dOut[i] - dot(dOut, S))  per row."""
+    row = locomp.program_id(0)
+    dot = 0.0
+    for k in range(N):
+        dot = dot + locomp.load(GradOut + row * N + k) * locomp.load(FwdOut + row * N + k)
+    for k in range(N):
+        s_i = locomp.load(FwdOut + row * N + k)
+        g_i = locomp.load(GradOut + row * N + k)
+        grad = s_i * (g_i - dot)
+        locomp.store(GradIn + row * N + k, locomp.load(GradIn + row * N + k) + grad)
+
+# ── cross_entropy: CE = -sum(P * log(Q + eps))  (P=target, Q=softmax output) ─
+
+def _fwd_ce_row(P: _T, Q: _T, Loss: _T, B: _cx, N: _cx):
+    """1 thread per example. Loss[b] = -sum_k P[b,k]*log(Q[b,k]+eps)."""
+    b = locomp.program_id(0)
+    acc = 0.0
+    for k in range(N):
+        p = locomp.load(P + b * N + k)
+        q = locomp.load(Q + b * N + k)
+        acc = acc - p * locomp.log(q + 1e-8)
+    locomp.store(Loss + b, acc)
+
+def _bwd_ce_dq(GradLoss: _T, P: _T, Q: _T, GradQ: _T, B: _cx, N: _cx):
+    """dQ[b,k] += GradLoss[b] * (-P[b,k] / (Q[b,k]+eps))."""
+    b = locomp.program_id(0)
+    g = locomp.load(GradLoss + b)
+    for k in range(N):
+        p = locomp.load(P + b * N + k)
+        q = locomp.load(Q + b * N + k)
+        idx = b * N + k
+        grad = -g * p / (q + 1e-8)
+        locomp.store(GradQ + idx, locomp.load(GradQ + idx) + grad)
+
 # ── matvec: out = A @ x  (A: M×K, x: K, out: M) ────────────────────────────
 
 def _fwd_matvec(A: _T, X: _T, Out: _T,
@@ -567,4 +688,144 @@ def matvec(A: GPUTensor, x: GPUTensor, M: int, K: int) -> GPUTensor:
             A._accum_grad(dA)
 
     _record(out, _bwd, [A, x])
+    return out
+
+
+def pow(a: GPUTensor, exp: float) -> GPUTensor:
+    """Element-wise a^exp."""
+    n = a.size
+    a_saved = a._locomp
+    out = empty(n, backend=a._backend)
+    fwd = _k("fwd_pow", _fwd_pow, a._backend)
+    fwd[(n,), (1,)](a._locomp, out._locomp, n, float(exp))
+
+    def _bwd():
+        g = out.grad
+        if g is None or not a.requires_grad:
+            return
+        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        k = _k("bwd_pow", _bwd_pow, a._backend)
+        k[(n,), (1,)](g._locomp, a_saved, da._locomp, n, float(exp))
+        a._accum_grad(da)
+
+    _record(out, _bwd, [a])
+    return out
+
+
+def sigmoid(a: GPUTensor) -> GPUTensor:
+    """Element-wise sigmoid."""
+    n = a.size
+    out = empty(n, backend=a._backend)
+    fwd = _k("fwd_sigmoid", _fwd_sigmoid_k, a._backend)
+    fwd[(n,), (1,)](a._locomp, out._locomp, n)
+    out_saved = out._locomp
+
+    def _bwd():
+        g = out.grad
+        if g is None or not a.requires_grad:
+            return
+        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        k = _k("bwd_sigmoid", _bwd_sigmoid_k, a._backend)
+        k[(n,), (1,)](g._locomp, out_saved, da._locomp, n)
+        a._accum_grad(da)
+
+    _record(out, _bwd, [a])
+    return out
+
+
+def tanh(a: GPUTensor) -> GPUTensor:
+    """Element-wise tanh."""
+    n = a.size
+    out = empty(n, backend=a._backend)
+    fwd = _k("fwd_tanh", _fwd_tanh_k, a._backend)
+    fwd[(n,), (1,)](a._locomp, out._locomp, n)
+    out_saved = out._locomp
+
+    def _bwd():
+        g = out.grad
+        if g is None or not a.requires_grad:
+            return
+        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        k = _k("bwd_tanh", _bwd_tanh_k, a._backend)
+        k[(n,), (1,)](g._locomp, out_saved, da._locomp, n)
+        a._accum_grad(da)
+
+    _record(out, _bwd, [a])
+    return out
+
+
+def matmul(A: GPUTensor, B: GPUTensor, M: int, K: int, N: int) -> GPUTensor:
+    """Matrix multiply: C = A @ B  (A: M×K, B: K×N, C: M×N, all row-major flat)."""
+    A_saved, B_saved = A._locomp, B._locomp
+    out_lt = locomp.empty(M * N)
+    fwd = _k("fwd_matmul", _fwd_matmul, A._backend)
+    fwd[(M * N,), (1,)](A._locomp, B._locomp, out_lt, M, K, N)
+    out = GPUTensor(out_lt, backend=A._backend)
+
+    def _bwd():
+        g = out.grad
+        if g is None:
+            return
+        if A.requires_grad:
+            dA = GPUTensor(locomp.zeros(M * K), backend=A._backend)
+            k = _k("bwd_matmul_A", _bwd_matmul_A, A._backend)
+            k[(M * K,), (1,)](g._locomp, B_saved, dA._locomp, M, K, N)
+            A._accum_grad(dA)
+        if B.requires_grad:
+            dB = GPUTensor(locomp.zeros(K * N), backend=B._backend)
+            k = _k("bwd_matmul_B", _bwd_matmul_B, B._backend)
+            k[(K * N,), (1,)](g._locomp, A_saved, dB._locomp, M, K, N)
+            B._accum_grad(dB)
+
+    _record(out, _bwd, [A, B])
+    return out
+
+
+def softmax(a: GPUTensor, M: int, N: int) -> GPUTensor:
+    """Row-wise softmax. Input: M×N flattened. Output: M×N flattened."""
+    out_lt = locomp.empty(M * N)
+    fwd = _k("fwd_softmax", _fwd_softmax_row, a._backend)
+    fwd[(M,), (1,)](a._locomp, out_lt, M, N)
+    out = GPUTensor(out_lt, backend=a._backend)
+    out_saved = out_lt
+
+    def _bwd():
+        g = out.grad
+        if g is None or not a.requires_grad:
+            return
+        da = GPUTensor(locomp.zeros(M * N), backend=a._backend)
+        k = _k("bwd_softmax", _bwd_softmax_row, a._backend)
+        k[(M,), (1,)](g._locomp, out_saved, da._locomp, M, N)
+        a._accum_grad(da)
+
+    _record(out, _bwd, [a])
+    return out
+
+
+def cross_entropy(q: GPUTensor, p: GPUTensor, B: int, N: int) -> GPUTensor:
+    """Cross entropy loss: Loss[b] = -sum_k p[b,k]*log(q[b,k]+eps).
+
+    Args:
+        q: softmax probabilities (B×N flattened), requires_grad
+        p: one-hot targets (B×N flattened), no grad
+        B: batch size, N: num classes
+    Returns:
+        GPUTensor of size B (per-example loss).
+    """
+    out_lt = locomp.empty(B)
+    fwd = _k("fwd_ce", _fwd_ce_row, q._backend)
+    fwd[(B,), (1,)](p._locomp, q._locomp, out_lt, B, N)
+    out = GPUTensor(out_lt, backend=q._backend)
+    p_saved, q_saved = p._locomp, q._locomp
+
+    def _bwd():
+        g = out.grad
+        if g is None or not q.requires_grad:
+            return
+        dq = GPUTensor(locomp.zeros(B * N), backend=q._backend)
+        k = _k("bwd_ce_dq", _bwd_ce_dq, q._backend)
+        k[(B,), (1,)](g._locomp, p_saved, q_saved, dq._locomp, B, N)
+        q._accum_grad(dq)
+
+    _record(out, _bwd, [q])
     return out
