@@ -41,7 +41,7 @@ def _k(name: str, fn: Callable, backend: str) -> "locomp.KernelLauncher":
 
 def _zeros_like(t: "GPUTensor") -> "GPUTensor":
     n = t._locomp.size
-    z = locomp.zeros(n, dtype=t._locomp.dtype)
+    z = locomp.zeros(n, dtype=t._locomp.dtype, backend=t._backend)
     return GPUTensor(z, requires_grad=False, backend=t._backend)
 
 
@@ -397,7 +397,8 @@ class GPUTensor:
 def tensor(data: np.ndarray, requires_grad: bool = False,
            backend: str = "auto") -> GPUTensor:
     """Create a GPUTensor from a NumPy array."""
-    lt = locomp.tensor(np.asarray(data, dtype=np.float32))
+    arr = np.asarray(data, dtype=np.float32)
+    lt = locomp.tensor(arr, backend=backend)
     return GPUTensor(lt, requires_grad=requires_grad, backend=backend)
 
 
@@ -409,7 +410,7 @@ def empty(shape, backend: str = "auto") -> GPUTensor:
         n = 1
         for s in shape:
             n *= s
-    lt = locomp.empty(n)
+    lt = locomp.empty(n, backend=backend)
     return GPUTensor(lt, requires_grad=False, backend=backend)
 
 
@@ -501,7 +502,7 @@ def sub(a: GPUTensor, b: GPUTensor) -> GPUTensor:
             # grad for b is -g
             neg_g = empty(n, backend=b._backend)
             k_neg = _k("fwd_sub_neg", _bwd_sub_b, b._backend)
-            neg_g_lt = locomp.zeros(n)
+            neg_g_lt = locomp.zeros(n, backend=b._backend)
             k_neg[(n,), (1,)](g._locomp, neg_g_lt, n)
             b._accum_grad(GPUTensor(neg_g_lt, backend=b._backend))
 
@@ -522,11 +523,11 @@ def mul(a: GPUTensor, b: GPUTensor) -> GPUTensor:
             return
         k_mul = _k("bwd_mul", _bwd_mul, a._backend)
         if a.requires_grad:
-            da = GPUTensor(locomp.zeros(n), backend=a._backend)
+            da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
             k_mul[(n,), (1,)](g._locomp, b_saved, da._locomp, n)
             a._accum_grad(da)
         if b.requires_grad:
-            db = GPUTensor(locomp.zeros(n), backend=b._backend)
+            db = GPUTensor(locomp.zeros(n, backend=b._backend), backend=b._backend)
             k_mul[(n,), (1,)](g._locomp, a_saved, db._locomp, n)
             b._accum_grad(db)
 
@@ -546,12 +547,12 @@ def div(a: GPUTensor, b: GPUTensor) -> GPUTensor:
         if g is None:
             return
         if a.requires_grad:
-            da = GPUTensor(locomp.zeros(n), backend=a._backend)
+            da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
             k = _k("bwd_div_a", _bwd_div_a, a._backend)
             k[(n,), (1,)](g._locomp, b_saved, da._locomp, n)
             a._accum_grad(da)
         if b.requires_grad:
-            db = GPUTensor(locomp.zeros(n), backend=b._backend)
+            db = GPUTensor(locomp.zeros(n, backend=b._backend), backend=b._backend)
             k = _k("bwd_div_b", _bwd_div_b, b._backend)
             k[(n,), (1,)](g._locomp, a_saved, b_saved, db._locomp, n)
             b._accum_grad(db)
@@ -571,7 +572,7 @@ def exp(a: GPUTensor) -> GPUTensor:
         g = out.grad
         if g is None or not a.requires_grad:
             return
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_exp", _bwd_exp, a._backend)
         k[(n,), (1,)](g._locomp, out_saved, da._locomp, n)
         a._accum_grad(da)
@@ -591,7 +592,7 @@ def log(a: GPUTensor) -> GPUTensor:
         g = out.grad
         if g is None or not a.requires_grad:
             return
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_log", _bwd_log, a._backend)
         k[(n,), (1,)](g._locomp, a_saved, da._locomp, n)
         a._accum_grad(da)
@@ -611,7 +612,7 @@ def relu(a: GPUTensor) -> GPUTensor:
         g = out.grad
         if g is None or not a.requires_grad:
             return
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_relu", _bwd_relu, a._backend)
         k[(n,), (1,)](g._locomp, a_saved, da._locomp, n)
         a._accum_grad(da)
@@ -633,7 +634,7 @@ def sum(a: GPUTensor) -> GPUTensor:
         if g is None or not a.requires_grad:
             return
         g_cpu = float(g._locomp.numpy()[0])  # read scalar grad to CPU
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_broadcast", _bwd_broadcast, a._backend)
         k[(n,), (1,)](da._locomp, n, g_cpu)
         a._accum_grad(da)
@@ -655,7 +656,7 @@ def mean(a: GPUTensor) -> GPUTensor:
         if g is None or not a.requires_grad:
             return
         g_cpu = float(g._locomp.numpy()[0]) / n  # scalar grad / N
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_broadcast", _bwd_broadcast, a._backend)
         k[(n,), (1,)](da._locomp, n, g_cpu)
         a._accum_grad(da)
@@ -703,7 +704,7 @@ def pow(a: GPUTensor, exp: float) -> GPUTensor:
         g = out.grad
         if g is None or not a.requires_grad:
             return
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_pow", _bwd_pow, a._backend)
         k[(n,), (1,)](g._locomp, a_saved, da._locomp, n, float(exp))
         a._accum_grad(da)
@@ -724,7 +725,7 @@ def sigmoid(a: GPUTensor) -> GPUTensor:
         g = out.grad
         if g is None or not a.requires_grad:
             return
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_sigmoid", _bwd_sigmoid_k, a._backend)
         k[(n,), (1,)](g._locomp, out_saved, da._locomp, n)
         a._accum_grad(da)
@@ -745,7 +746,7 @@ def tanh(a: GPUTensor) -> GPUTensor:
         g = out.grad
         if g is None or not a.requires_grad:
             return
-        da = GPUTensor(locomp.zeros(n), backend=a._backend)
+        da = GPUTensor(locomp.zeros(n, backend=a._backend), backend=a._backend)
         k = _k("bwd_tanh", _bwd_tanh_k, a._backend)
         k[(n,), (1,)](g._locomp, out_saved, da._locomp, n)
         a._accum_grad(da)

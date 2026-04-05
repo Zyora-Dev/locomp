@@ -281,3 +281,71 @@ def test_cuda_kernel_vector_add():
     np.testing.assert_allclose(result, np.full(N, 3.0, dtype=np.float32))
 
     a.free(); b.free(); out.free()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-GPU tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cuda_device_count_in_locomp_namespace():
+    """cuda_device_count() is always callable and returns a non-negative int."""
+    n = locomp.cuda_device_count()
+    assert isinstance(n, int)
+    assert n >= 0
+
+
+def test_cuda_set_device_in_locomp_namespace():
+    """cuda_set_device is exported from the locomp namespace."""
+    assert callable(locomp.cuda_set_device)
+
+
+@nvidia_only
+def test_cuda_device_count_positive():
+    """On a CUDA-capable machine there must be at least 1 GPU."""
+    assert locomp.cuda_device_count() >= 1
+
+
+@nvidia_only
+def test_cuda_set_device_device0():
+    """Selecting device 0 always succeeds when CUDA is available."""
+    locomp.cuda_set_device(0)  # should not raise
+
+
+@nvidia_only
+def test_cuda_set_device_invalid_raises():
+    """Selecting an out-of-range device raises CUDARuntimeError."""
+    with pytest.raises(CUDARuntimeError):
+        locomp.cuda_set_device(9999)
+
+
+multi_gpu = pytest.mark.skipif(
+    not HAS_CUDA or locomp.cuda_device_count() < 2,
+    reason="requires at least 2 CUDA GPUs",
+)
+
+
+@multi_gpu
+def test_cuda_set_device_roundtrip():
+    """Switch between device 0 and 1, allocate a tensor on each, verify data."""
+    rt = get_runtime()
+
+    locomp.cuda_set_device(0)
+    arr0 = np.full(256, 1.0, dtype=np.float32)
+    t0 = rt.upload(arr0)
+
+    locomp.cuda_set_device(1)
+    arr1 = np.full(256, 2.0, dtype=np.float32)
+    t1 = rt.upload(arr1)
+
+    # Device 0 roundtrip
+    locomp.cuda_set_device(0)
+    np.testing.assert_allclose(t0.numpy(), arr0)
+
+    # Device 1 roundtrip (set active device back first)
+    locomp.cuda_set_device(1)
+    np.testing.assert_allclose(t1.numpy(), arr1)
+
+    t0.free(); t1.free()
+
+    # Leave driver on device 0 so other tests are unaffected
+    locomp.cuda_set_device(0)

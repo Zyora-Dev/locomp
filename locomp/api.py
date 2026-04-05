@@ -1182,3 +1182,37 @@ def set_device(index: int = 0):
     """Select which GPU device to use (for multi-GPU systems)."""
     from locomp.backends.metal_runtime import set_device as _set_device
     _set_device(index)
+
+
+def cuda_set_device(device_id: int):
+    """Select which CUDA GPU to use for subsequent kernel launches.
+
+    On multi-GPU systems, call this before launching kernels to direct
+    work to a specific device (0-indexed).  Raises CUDARuntimeError if
+    the CUDA runtime is not available or ``device_id`` is out of range.
+
+    Example::
+
+        import locomp
+        locomp.cuda_set_device(1)          # switch to GPU 1
+        count = locomp.cuda_device_count() # how many GPUs are available
+    """
+    from locomp.backends.cuda_runtime import get_runtime
+    get_runtime().set_device(device_id)
+
+
+def cuda_device_count() -> int:
+    """Return the number of CUDA-capable GPUs on this machine.
+
+    Returns 0 if the CUDA runtime is not available.
+
+    Example::
+
+        import locomp
+        n = locomp.cuda_device_count()  # e.g. 8 on an 8×A100 node
+    """
+    from locomp.backends.cuda_runtime import get_runtime, CUDARuntimeError
+    try:
+        return get_runtime().device_count()
+    except CUDARuntimeError:
+        return 0
