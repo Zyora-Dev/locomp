@@ -182,29 +182,36 @@ def run_cuda_benchmarks():
     # ═══════════════════════════════════════════════════════════════════════════
     # Section 1 — 1B-element bandwidth tests (stress A100 HBM2e ~2 TB/s)
     # ═══════════════════════════════════════════════════════════════════════════
-    BS = 256
+    # Tiled kernels: each thread handles EPT=4 consecutive elements via float4
+    # load/store (LDG.128 / STG.128). Grid = N / (BS * EPT).
+    BS  = 256    # threads per block
+    EPT = 4      # elements per thread  (must be multiple of 4 for float4)
+    BLK = BS * EPT  # = 1024 elements per block — mirrors Triton BLOCK=1024
     N1B = 1 << 30   # 1 073 741 824 elements × 4 bytes = 4 GB per array
-    G1B = N1B // BS  # grid blocks
+    G1B = N1B // BLK
 
     def vector_add(A: locomp.Tensor, B: locomp.Tensor, Out: locomp.Tensor,
                    N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
-        i = bid * 256 + tid
-        locomp.store(Out + i, locomp.load(A + i) + locomp.load(B + i))
+        base = (bid * 256 + tid) * 4
+        offs = locomp.arange(0, 4) + base
+        locomp.store(Out + offs, locomp.load(A + offs) + locomp.load(B + offs))
 
     def scale_shift(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
-        i = bid * 256 + tid
-        locomp.store(Out + i, locomp.load(X + i) * 2.0 + 1.0)
+        base = (bid * 256 + tid) * 4
+        offs = locomp.arange(0, 4) + base
+        locomp.store(Out + offs, locomp.load(X + offs) * 2.0 + 1.0)
 
     def relu(X: locomp.Tensor, Out: locomp.Tensor, N: locomp.constexpr):
         bid = locomp.program_id(0)
         tid = locomp.local_id(0)
-        i = bid * 256 + tid
-        x = locomp.load(X + i)
-        locomp.store(Out + i, locomp.where(x > 0.0, x, 0.0))
+        base = (bid * 256 + tid) * 4
+        offs = locomp.arange(0, 4) + base
+        x = locomp.load(X + offs)
+        locomp.store(Out + offs, locomp.where(x > 0.0, x, 0.0))
 
     rng = np.random.default_rng(42)
     a1b = rng.standard_normal(N1B).astype(np.float32)
