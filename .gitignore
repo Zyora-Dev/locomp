@@ -35,5 +35,5 @@ debug_ir.py
 _test_tensor_ops.py
 .env
 
-# Website source is tracked; website/.gitignore excludes node_modules/.next/out/
-# website/
+# Website (not part of the compiler library)
+website/
