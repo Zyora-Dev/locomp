@@ -11,6 +11,7 @@ from locomp.profiler import profile, Profiler, ProfileResult
 from locomp import autograd as ag
 from locomp import gpu_autograd as gpu_ag
 from locomp.backends.cuda_runtime import CUDATensor, is_available as cuda_available
+from locomp.backends.rocm_runtime import ROCmTensor, is_available as rocm_available
 from locomp.api import (
     kernel,
     program_id,
@@ -80,6 +81,8 @@ from locomp.api import (
     set_device,
     cuda_set_device,
     cuda_device_count,
+    rocm_set_device,
+    rocm_device_count,
     embed_lookup,
     jit,
     JITKernelLauncher,
@@ -190,4 +193,8 @@ __all__ = [
     "Bool",
     "CUDATensor",
     "cuda_available",
+    "ROCmTensor",
+    "rocm_available",
+    "rocm_set_device",
+    "rocm_device_count",
 ]

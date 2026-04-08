@@ -326,10 +326,13 @@ def tensor(data, dtype=np.float32, backend: str = "auto"):
     Args:
         data:    list, numpy array, or scalar
         dtype:   numpy dtype (default float32)
-        backend: "auto" | "metal" | "cuda" | "cpu"
+        backend: "auto" | "metal" | "cuda" | "rocm" | "cpu"
                  "auto" → cuda if CUDA available, else metal/cpu
     """
     arr = np.asarray(data, dtype=dtype) if not isinstance(data, np.ndarray) else data
+    if _use_rocm(backend):
+        from locomp.backends.rocm_runtime import get_runtime as _get_rocm_rt
+        return _get_rocm_rt().upload(arr)
     if _use_cuda(backend):
         from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
         return _get_cuda_rt().upload(arr)
@@ -340,6 +343,15 @@ def empty(shape, dtype=np.float32, backend: str = "auto"):
     """Create an empty locomp tensor."""
     if isinstance(shape, int):
         shape = (shape,)
+    if _use_rocm(backend):
+        from locomp.backends.rocm_runtime import get_runtime as _get_rocm_rt
+        rt = _get_rocm_rt()
+        size = 1
+        for s in shape:
+            size *= s
+        t = rt.empty(size, dtype)
+        t._shape = tuple(shape)
+        return t
     if _use_cuda(backend):
         from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
         rt = _get_cuda_rt()
@@ -356,6 +368,15 @@ def zeros(shape, dtype=np.float32, backend: str = "auto"):
     """Create a zero-filled locomp tensor."""
     if isinstance(shape, int):
         shape = (shape,)
+    if _use_rocm(backend):
+        from locomp.backends.rocm_runtime import get_runtime as _get_rocm_rt
+        rt = _get_rocm_rt()
+        size = 1
+        for s in shape:
+            size *= s
+        t = rt.zeros(size, dtype)
+        t._shape = tuple(shape)
+        return t
     if _use_cuda(backend):
         from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
         rt = _get_cuda_rt()
@@ -372,17 +393,25 @@ def ones(shape, dtype=np.float32, backend: str = "auto"):
     """Create a ones-filled locomp tensor."""
     if isinstance(shape, int):
         shape = (shape,)
+    if _use_rocm(backend):
+        from locomp.backends.rocm_runtime import get_runtime as _get_rocm_rt
+        return _get_rocm_rt().upload(np.ones(shape, dtype=dtype))
     if _use_cuda(backend):
         from locomp.backends.cuda_runtime import get_runtime as _get_cuda_rt
         return _get_cuda_rt().upload(np.ones(shape, dtype=dtype))
     return LocompTensor(np.ones(shape, dtype=dtype))
 
 
+def _use_rocm(backend: str) -> bool:
+    """Return True if ROCm/HIP device should be used for this backend setting."""
+    return backend == "rocm"
+
+
 def _use_cuda(backend: str) -> bool:
     """Return True if CUDA device should be used for this backend setting."""
     if backend == "cuda":
         return True
-    if backend in ("metal", "cpu", "riscv"):
+    if backend in ("metal", "cpu", "riscv", "rocm"):
         return False
     # "auto": use CUDA only on non-macOS if nvcc is available
     if platform.system() == "Darwin":
@@ -411,10 +440,13 @@ class KernelLauncher:
             if platform.system() == "Darwin":
                 return "metal"
             else:
-                # Prefer CUDA if nvidia-smi or nvcc available
                 import shutil
+                # Prefer CUDA if nvidia-smi or nvcc available
                 if shutil.which("nvcc") or shutil.which("nvidia-smi"):
                     return "cuda"
+                # Use ROCm if hipcc or rocm-smi available
+                if shutil.which("hipcc") or shutil.which("rocm-smi"):
+                    return "rocm"
                 return "riscv"
         return backend
 
@@ -437,6 +469,9 @@ class KernelLauncher:
         elif self.backend == "cuda":
             from locomp.backends.cuda_codegen import compile_to_cuda
             self._msl_source, self._buffer_map = compile_to_cuda(self._ir)
+        elif self.backend == "rocm":
+            from locomp.backends.rocm_codegen import compile_to_rocm
+            self._msl_source, self._buffer_map = compile_to_rocm(self._ir)
         else:
             raise NotImplementedError(f"Backend '{self.backend}' not implemented yet")
 
@@ -494,6 +529,8 @@ class _KernelCall:
             return self._launch_riscv(*args, **kwargs)
         elif self.launcher.backend == "cuda":
             return self._launch_cuda(*args, **kwargs)
+        elif self.launcher.backend == "rocm":
+            return self._launch_rocm(*args, **kwargs)
         else:
             raise NotImplementedError(f"Backend '{self.launcher.backend}' not implemented")
 
@@ -817,6 +854,143 @@ class _KernelCall:
         _cuda_rt.sync()
         for _ct in _tmp_uploads:
             _ct.free()
+
+    def _launch_rocm(self, *args, **kwargs):
+        """Launch kernel on AMD GPU using compiled HIP C (.hip via hipcc)."""
+        import ctypes
+        import hashlib
+        import os
+        import shutil
+        import tempfile
+        import subprocess
+        from locomp.backends.rocm_codegen import compile_to_rocm
+
+        all_args = list(args)
+        for value in kwargs.values():
+            all_args.append(value)
+
+        ir_params = self.launcher._ir.params
+        constexpr_values = {}
+        tensor_args = []
+
+        for i, arg in enumerate(all_args):
+            param = ir_params[i]
+            if param.is_pointer:
+                tensor_args.append(arg)
+            else:
+                if isinstance(arg, float):
+                    constexpr_values[param.name] = float(arg)
+                else:
+                    constexpr_values[param.name] = int(arg)
+
+        constexpr_key = tuple(sorted(constexpr_values.items()))
+
+        if constexpr_key not in self.launcher._specialized:
+            import json
+
+            # ── Disk cache: ~/.cache/locomp/rocm/<sha256>.so ──────────────────
+            hip_source, param_map = compile_to_rocm(
+                self.launcher._ir, constexpr_values=constexpr_values
+            )
+            self.launcher._msl_source = hip_source
+
+            src_hash = hashlib.sha256(hip_source.encode()).hexdigest()
+            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "locomp", "rocm")
+            os.makedirs(cache_dir, exist_ok=True)
+            cached_so = os.path.join(cache_dir, f"{src_hash}.so")
+            cached_meta = os.path.join(cache_dir, f"{src_hash}.json")
+
+            if os.path.exists(cached_so) and os.path.exists(cached_meta):
+                with open(cached_meta) as f:
+                    param_map = json.load(f)
+            else:
+                # Detect AMD GPU arch via rocminfo.
+                # rocminfo output example:  "  Name:                    gfx908"
+                # Fall back to gfx906 (MI50/MI60) — safe for most GFX9 installs.
+                amdgpu_target = "gfx906"
+                try:
+                    r = subprocess.run(
+                        ["rocminfo"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if r.returncode == 0:
+                        for line in r.stdout.splitlines():
+                            stripped = line.strip()
+                            # Match lines like "Name:  gfx908" or "  Name:                    gfx908"
+                            if stripped.lower().startswith("name:"):
+                                tok = [t for t in stripped.split() if t.lower().startswith("gfx")]
+                                if tok:
+                                    amdgpu_target = tok[0].lower()
+                                    break
+                except Exception:
+                    pass
+
+                with tempfile.NamedTemporaryFile(suffix=".hip", delete=False, mode="w") as f:
+                    f.write(hip_source)
+                    hip_path = f.name
+                tmp_so = hip_path.replace(".hip", ".so")
+                result = subprocess.run(
+                    ["hipcc", f"--amdgpu-target={amdgpu_target}",
+                     "-O3", "-shared", "-fPIC",
+                     "-o", tmp_so, hip_path],
+                    capture_output=True, timeout=120
+                )
+                os.unlink(hip_path)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"locomp ROCm backend: hipcc compilation failed.\n"
+                        f"{result.stderr.decode()}\n"
+                        "Make sure hipcc is installed: https://docs.amd.com/"
+                    )
+                shutil.move(tmp_so, cached_so)
+                with open(cached_meta, "w") as f:
+                    json.dump(param_map, f)
+
+            lib = ctypes.CDLL(cached_so)
+            launch_fn = getattr(lib, f"locomp_launch_{self.launcher.func_name}")
+            launch_fn.argtypes = [
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            launch_fn.restype = None
+            self.launcher._specialized[constexpr_key] = (launch_fn, param_map, hip_source, cached_so)
+
+        launch_fn, param_map, hip_source, so_path = self.launcher._specialized[constexpr_key]
+
+        grid_x = self.grid[0] if self.grid else 1
+        grid_y = self.grid[1] if len(self.grid) > 1 else 1
+        block_x = self.threadgroup_size[0] if self.threadgroup_size else 1
+        block_y = self.threadgroup_size[1] if self.threadgroup_size and len(self.threadgroup_size) > 1 else 1
+
+        from locomp.backends.rocm_runtime import get_runtime as _get_rocm_rt, ROCmTensor as _ROCmTensor
+        _rocm_rt = _get_rocm_rt()
+        _tmp_uploads = []
+        void_ptrs = []
+        for arg in tensor_args:
+            if isinstance(arg, _ROCmTensor):
+                void_ptrs.append(ctypes.c_void_p(arg._hip_ptr))
+            elif isinstance(arg, np.ndarray):
+                rt = _rocm_rt.upload(arg)
+                _tmp_uploads.append(rt)
+                void_ptrs.append(ctypes.c_void_p(rt._hip_ptr))
+            elif isinstance(arg, LocompTensor) and arg.data is not None:
+                rt = _rocm_rt.upload(arg.data)
+                _tmp_uploads.append(rt)
+                void_ptrs.append(ctypes.c_void_p(rt._hip_ptr))
+            else:
+                raise TypeError(f"Unsupported argument type for ROCm backend: {type(arg)}")
+
+        arr_type = (ctypes.c_void_p * len(void_ptrs))
+        c_arr = arr_type(*void_ptrs)
+        launch_fn(
+            ctypes.c_int(grid_x), ctypes.c_int(grid_y),
+            ctypes.c_int(block_x), ctypes.c_int(block_y),
+            ctypes.cast(c_arr, ctypes.POINTER(ctypes.c_void_p))
+        )
+        _rocm_rt.sync()
+        for _rt in _tmp_uploads:
+            _rt.free()
 
 
 def kernel(func: Callable = None, *, backend: str = "auto") -> KernelLauncher:
@@ -1216,4 +1390,27 @@ def cuda_device_count() -> int:
     try:
         return get_runtime().device_count()
     except CUDARuntimeError:
+        return 0
+
+
+def rocm_set_device(device_id: int):
+    """Select which ROCm GPU to use for subsequent kernel launches.
+
+    On multi-GPU AMD systems, call this before launching kernels to direct
+    work to a specific device (0-indexed).  Raises ROCmRuntimeError if
+    the ROCm runtime is not available or ``device_id`` is out of range.
+    """
+    from locomp.backends.rocm_runtime import get_runtime
+    get_runtime().set_device(device_id)
+
+
+def rocm_device_count() -> int:
+    """Return the number of ROCm-capable GPUs on this machine.
+
+    Returns 0 if the ROCm runtime is not available.
+    """
+    from locomp.backends.rocm_runtime import get_runtime, ROCmRuntimeError
+    try:
+        return get_runtime().device_count()
+    except ROCmRuntimeError:
         return 0
