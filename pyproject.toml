@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "locomp"
 version = "1.0.0"
-description = "A GPU compute compiler for Apple Metal — write kernels in Python, compile to native Metal shaders"
+description = "A Python GPU kernel compiler for Apple Silicon (Metal), NVIDIA (CUDA), AMD (ROCm/HIP), and RISC-V — write kernels once in Python, run on all four backends"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
     {name = "Locomp Contributors"}
 ]
-keywords = ["gpu", "compiler", "metal", "apple-silicon", "compute", "kernel"]
+keywords = ["gpu", "compiler", "metal", "apple-silicon", "cuda", "rocm", "amd", "hip", "risc-v", "compute", "kernel"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
